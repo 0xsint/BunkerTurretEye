@@ -78,7 +78,7 @@ def build_addon(name, source, guid, output, display_name=None):
 	resource = struct.pack("<II", len(body), 2) + body
 	archive = make_archive({resource_hash(name): resource})
 	title = display_name or name
-	description = "Requires Bingus Shared Loader v15 or newer / API 1. Enable both and deploy."
+	description = "Requires Bingus Shared Loader v21 or newer / API 1. Enable both and deploy."
 	manifest = {
 		"Version": 1,
 		"Guid": guid,

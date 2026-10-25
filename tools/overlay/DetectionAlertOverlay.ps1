@@ -3,11 +3,16 @@
     Always-on-top desktop overlay for the Detection Alert mod's turret eye.
 
 .DESCRIPTION
-    Neither Bingus Shared Loader nor HD2Runtime expose a safe in-game HUD/draw API, so
+    Bingus Shared Loader doesn't expose a safe in-game HUD/draw API, so
     detection_alert.lua instead writes its live state to
     %LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs\DetectionAlertStatus.log (one line per
     tick, throttled). This script polls that file's last line and renders a small
     borderless, always-on-top window showing the turret eye glow outside the game window.
+
+    Below the state label it shows how many enemies are searching and how many have detected
+    you. Those two numbers come from AggroCounter and read "n/a" while AggroCounter is off
+    (it is off on plain Lua 5.1 builds). "active units" is always shown: the number of units whose
+    animation changed in the last sampler pass. It measures activity, not enemies that saw you.
 
 .USAGE
     powershell -ExecutionPolicy Bypass -File tools\overlay\DetectionAlertOverlay.ps1
@@ -27,7 +32,7 @@ $form = New-Object System.Windows.Forms.Form
 $form.FormBorderStyle = 'None'
 $form.StartPosition = 'Manual'
 $form.Location = New-Object System.Drawing.Point(40, 40)
-$form.Size = New-Object System.Drawing.Size(220, 96)
+$form.Size = New-Object System.Drawing.Size(220, 128)
 $form.TopMost = $true
 $form.ShowInTaskbar = $false
 $form.BackColor = $BackdropColor
@@ -44,7 +49,7 @@ $form.Controls.Add($titleLabel)
 
 $stateLabel = New-Object System.Windows.Forms.Label
 $stateLabel.Text = 'WAITING...'
-# Font size 10 (down from 11) so the longest label, "ENEMIES NEARBY", still fits on one line.
+# Font size 10 (down from 11) so the state labels fit on one line.
 $stateLabel.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
 $stateLabel.ForeColor = $IdleTextColor
 $stateLabel.AutoSize = $false
@@ -52,6 +57,17 @@ $stateLabel.Size = New-Object System.Drawing.Size(220, 28)
 $stateLabel.Location = New-Object System.Drawing.Point(0, 56)
 $stateLabel.TextAlign = 'MiddleCenter'
 $form.Controls.Add($stateLabel)
+
+# Two lines under the state label: "searching / detected you" and "active units".
+$countLabel = New-Object System.Windows.Forms.Label
+$countLabel.Text = ''
+$countLabel.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+$countLabel.ForeColor = $IdleTextColor
+$countLabel.AutoSize = $false
+$countLabel.Size = New-Object System.Drawing.Size(220, 36)
+$countLabel.Location = New-Object System.Drawing.Point(0, 86)
+$countLabel.TextAlign = 'MiddleCenter'
+$form.Controls.Add($countLabel)
 
 # The eye: a filled circle whose color is driven by the mod's eye_color (r,g,b in 0..1).
 $eyePanel = New-Object System.Windows.Forms.Panel
@@ -86,7 +102,7 @@ $dragMoveHandler = {
     }
 }
 $dragEndHandler = { $dragging = $false }
-foreach ($control in @($form, $titleLabel, $stateLabel, $eyePanel)) {
+foreach ($control in @($form, $titleLabel, $stateLabel, $countLabel, $eyePanel)) {
     $control.Add_MouseDown($dragHandler)
     $control.Add_MouseMove($dragMoveHandler)
     $control.Add_MouseUp($dragEndHandler)
@@ -115,20 +131,33 @@ function Get-LastStatusLine {
 
 function Parse-StatusLine([string]$line) {
     if (-not $line) { return $null }
-    # nearby/searching are optional so older log lines (written before those fields
-    # existed) still parse.
-    $pattern = 't=(?<t>[\d.\-]+) detected=(?<d>[01]) intensity=(?<i>[\d.\-]+) r=(?<r>[\d.\-]+) g=(?<g>[\d.\-]+) b=(?<b>[\d.\-]+)(?: nearby=(?<n>[01]) searching=(?<s>[01]))?'
+    # searching, the count fields and nearby are all optional, so older log lines (written before
+    # those fields existed) still parse; the nearby value is no longer shown. A count of -1 means
+    # the mod has no real number (AggroCounter off).
+    $pattern = 't=(?<t>[\d.\-]+) detected=(?<d>[01]) intensity=(?<i>[\d.\-]+) r=(?<r>[\d.\-]+) g=(?<g>[\d.\-]+) b=(?<b>[\d.\-]+)(?: nearby=[01])?(?: searching=(?<s>[01]))?(?: search_count=(?<sc>-?\d+))?(?: detect_count=(?<dc>-?\d+))?(?: active_units=(?<au>-?\d+))?(?: count_source=(?<cs>\w+))?'
     $match = [regex]::Match($line, $pattern)
     if (-not $match.Success) { return $null }
     return [PSCustomObject]@{
-        Detected  = $match.Groups['d'].Value -eq '1'
-        Intensity = [double]$match.Groups['i'].Value
-        R         = [double]$match.Groups['r'].Value
-        G         = [double]$match.Groups['g'].Value
-        B         = [double]$match.Groups['b'].Value
-        Nearby    = $match.Groups['n'].Success -and ($match.Groups['n'].Value -eq '1')
-        Searching = $match.Groups['s'].Success -and ($match.Groups['s'].Value -eq '1')
+        Detected    = $match.Groups['d'].Value -eq '1'
+        Intensity   = [double]$match.Groups['i'].Value
+        R           = [double]$match.Groups['r'].Value
+        G           = [double]$match.Groups['g'].Value
+        B           = [double]$match.Groups['b'].Value
+        Searching   = $match.Groups['s'].Success -and ($match.Groups['s'].Value -eq '1')
+        SearchCount = $(if ($match.Groups['sc'].Success) { [int]$match.Groups['sc'].Value } else { -1 })
+        DetectCount = $(if ($match.Groups['dc'].Success) { [int]$match.Groups['dc'].Value } else { -1 })
+        ActiveUnits = $(if ($match.Groups['au'].Success) { [int]$match.Groups['au'].Value } else { $null })
+        CountSource = $(if ($match.Groups['cs'].Success) { $match.Groups['cs'].Value } else { 'none' })
     }
+}
+
+# "n/a" unless AggroCounter supplied real numbers; active units are always shown when the mod reports them.
+function Format-Counts($status) {
+    $activeText = if ($null -ne $status.ActiveUnits) { "active units: $($status.ActiveUnits)" } else { 'active units: -' }
+    if ($status.CountSource -eq 'aggro' -and $status.SearchCount -ge 0 -and $status.DetectCount -ge 0) {
+        return "searching: $($status.SearchCount)   detected you: $($status.DetectCount)`n$activeText"
+    }
+    return "searching: n/a   detected you: n/a`n$activeText"
 }
 
 $lastSeenAt = Get-Date
@@ -139,6 +168,7 @@ $timer.Add_Tick({
     if ($null -eq $status) {
         $stateLabel.Text = 'WAITING...'
         $stateLabel.ForeColor = $IdleTextColor
+        $countLabel.Text = ''
         return
     }
     $lastSeenAt = Get-Date
@@ -147,15 +177,13 @@ $timer.Add_Tick({
         [int]([math]::Round($status.R * 255)),
         [int]([math]::Round($status.G * 255)),
         [int]([math]::Round($status.B * 255)))
+    $countLabel.Text = Format-Counts $status
     if ($status.Detected) {
         $stateLabel.Text = 'DETECTED'
         $stateLabel.ForeColor = [System.Drawing.Color]::FromArgb(255, 255, 70, 70)
     } elseif ($status.Searching) {
         $stateLabel.Text = 'SEARCHING'
         $stateLabel.ForeColor = [System.Drawing.Color]::FromArgb(255, 255, 180, 60)
-    } elseif ($status.Nearby) {
-        $stateLabel.Text = 'ENEMIES NEARBY'
-        $stateLabel.ForeColor = [System.Drawing.Color]::FromArgb(255, 230, 210, 80)
     } else {
         $stateLabel.Text = 'HIDDEN'
         $stateLabel.ForeColor = $IdleTextColor

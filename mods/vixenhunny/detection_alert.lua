@@ -1,59 +1,38 @@
--- HD2-Addon: mods/bunkerturreteye/detection_alert
+-- HD2-Addon: mods/vixenhunny/detection_alert
 
--- Detection Alert: combines a Wwise audio-state heuristic with HD2Runtime's proven
--- combat events (player_damaged / entity_damaged / entity_killed) as two independent
--- "are we in a fight" signals, OR'd together.
+-- Detection Alert: drives the eye alert from whichever detection source is live.
+--   1. Wwise audio-state heuristic: only works on builds that still have WwiseFlowCallbacks.
+--   2. Enemy sampler: a read-only walk over the main world's units that counts animation-state changes
+--      per pass. Current Steam builds have no Wwise callbacks, so this is the live source there.
 -- Requires Bingus Shared Loader v15+ (https://github.com/CowboyBingus/BingusSharedLoader).
--- HD2Runtime (https://github.com/SkyeShade/HD2Runtime) is an optional soft dependency:
--- if it is not installed, the mod falls back to the Wwise heuristic alone.
 -- Targets plain Lua 5.1.4 (current builds have no LuaJIT): no 5.2+ syntax or library calls.
 --
--- Current Steam builds remove HD2Runtime's memory access and the Wwise callbacks, so no detection
--- source is live there. The mod then runs in probe mode: it logs what the runtime exposes (the
--- "probe" lines in DetectionAlert.log), logs AggroCounter.counts when AggroCounter is running, and
--- samples enemy animation states read-only (shadow mode: logged only, not used for detection yet).
+-- The Wwise heuristic is a practical proxy for "are we in a fight", not a direct AI-perception query.
+-- The sampler is the same kind of proxy: it measures how much enemy animation is changing, not what the
+-- AI perceives. Its thresholds (DETECT_*/SEARCH_* below) are starting values, tune them against the
+-- "pass" lines in DetectionAlert.log, which show active=, detected= and searching= for every pass.
 --
--- Neither source is a direct AI-perception query -- HD2Runtime's event catalog has no
--- "enemy spotted you" event yet -- so this remains a practical proxy, not raw detection.
---
--- enemies_nearby / enemies_searching below are extra status-only signals (reported in the
--- log/overlay) that do not drive the eye's is_detected/eye_color behavior:
---   enemies_nearby   -- HD2Runtime-only: any tracked hostile entity within range of the player.
---   enemies_searching -- Wwise's lighter "alert" keywords, or any combat-tier signal (which
---                        implies awareness too), without requiring full is_detected.
+-- enemies_searching is an extra status-only signal (reported in the log/overlay) that does not drive the
+-- eye's is_detected/eye_color behavior: the Wwise "alert" keywords, or any combat keyword, or the
+-- sampler's lower activity tier, without requiring full is_detected.
 --
 -- Diagnostics: DetectionAlert.log (in %LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs) records the
 -- startup checks, the first few calls to each hooked Wwise callback, every state change, errors,
--- and a heartbeat every 5 s. Startup and error lines are also copied to HD2Runtime.log.
-
-local MOD_ID = "mods/bunkerturreteye/detection_alert"
-
-local require_ok, hd2_module = pcall(require, "mods/skyeshade/hd2runtime")
-local hd2_ok = require_ok and type(hd2_module) == "table"
-local hd2 = hd2_ok and hd2_module or nil
-local hd2_load_error = nil
-if not hd2_ok then
-	hd2_load_error = require_ok and ("require returned " .. type(hd2_module)) or tostring(hd2_module)
-end
-
--- The HD2Runtime mod context: its log() writes to HD2Runtime.log, and it owns our subscriptions.
-local hd2_mod = nil
-local hd2_mod_error = nil
-if hd2_ok then
-	local mod_ok, context = pcall(hd2.mod, MOD_ID)
-	if mod_ok and context then
-		hd2_mod = context
-	else
-		hd2_mod_error = tostring(context)
-	end
-end
+-- and a heartbeat every 5 s.
 
 local DetectionAlert = {
 	is_detected = false,
 	eye_intensity = 0, -- 0 = idle ember glow, 1 = full alert red
 	eye_color = nil, -- set below from EYE_COLOR_IDLE
-	enemies_nearby = false, -- status-only: HD2Runtime hostile entity within HD2_ENEMY_NEARBY_RANGE_METERS
-	enemies_searching = false, -- status-only: alert-tier audio or active combat, short of full detection
+	enemies_searching = false, -- status-only: alert-tier audio/activity or combat keywords, short of full detection
+	-- Counts for the overlay. search_count/detect_count are REAL numbers, taken from AggroCounter (search / me)
+	-- when it is running, and -1 when it is not (it is off on plain Lua 5.1 builds). The sampler cannot tell
+	-- searching from detecting per enemy, so it only supplies active_units: units whose animation state
+	-- changed in the last pass (ambient units excluded). That is activity, not a count of enemies that saw you.
+	search_count = -1,
+	detect_count = -1,
+	active_units = 0,
+	count_source = "none", -- "aggro" or "none"
 }
 
 -- "alert"/"aggro"/"detect" read as the AI noticing/searching, short of confirmed combat;
@@ -91,15 +70,6 @@ local function update_eye_glow(dt)
 	DetectionAlert.eye_color.b = EYE_COLOR_IDLE.b + (EYE_COLOR_ALERT.b - EYE_COLOR_IDLE.b) * t
 end
 
--- Instantly snaps the eye to full alert red, bypassing the ramp (used for the
--- near-turret damage flash, which should read as a startle, not a fade-in).
-local function flash_eye_now()
-	DetectionAlert.eye_intensity = 1
-	DetectionAlert.eye_color.r = EYE_COLOR_ALERT.r
-	DetectionAlert.eye_color.g = EYE_COLOR_ALERT.g
-	DetectionAlert.eye_color.b = EYE_COLOR_ALERT.b
-end
-
 -- Lua patterns have no alternation operator, so check a keyword list plainly.
 local function contains_any(haystack, keywords)
 	for _, keyword in ipairs(keywords) do
@@ -112,7 +82,7 @@ end
 
 -- Logging: DetectionAlert.log and DetectionAlertStatus.log are opened through the loader's
 -- open_log when it offers one, otherwise directly in the loader's log folder. A line that can't
--- reach a file goes to HD2Runtime.log (via hd2.mod), or the console as a last resort.
+-- reach a file goes to the console.
 local LOG_DIR_SUFFIX = "\\CowboyBingus\\Helldivers2\\Logs\\"
 local LOG_FILE_NAME = "DetectionAlert.log"
 local STATUS_FILE_NAME = "DetectionAlertStatus.log"
@@ -153,11 +123,8 @@ local function write_line(handle, text)
 	handle:flush()
 end
 
--- Used while no file is open: HD2Runtime.log first, then the console.
+-- Used while no file is open: the console.
 local function emit_fallback(text)
-	if hd2_mod and pcall(hd2_mod.log, hd2_mod, text) then
-		return
-	end
 	if type(print) == "function" then
 		print(text)
 	end
@@ -179,19 +146,47 @@ local function log(text)
 	emit_fallback(text)
 end
 
--- Like log(), and also copied to HD2Runtime.log / console so startup and failures show up there too.
-local function log_important(text)
-	log(text)
-	if log_file then
-		emit_fallback(text)
-	end
-end
-
 local function log_error(where, err)
 	error_count = error_count + 1
 	if error_count <= 20 or error_count % 100 == 0 then
-		log_important(string.format("[DetectionAlert] ERROR #%d in %s: %s", error_count, where, tostring(err)))
+		log(string.format("[DetectionAlert] ERROR #%d in %s: %s", error_count, where, tostring(err)))
 	end
+end
+
+-- Detection sources. is_detected / enemies_searching are the OR of every live source (Wwise audio keywords,
+-- sampler activity). Each source only sets its own flag; these functions combine them. They sit here, ahead
+-- of the sampler, because the sampler's pass logging calls them.
+local wwise_detected = false
+local wwise_searching = false
+local sampler_detected = false
+local sampler_searching = false
+
+-- Compare before writing, so both directions (DETECTED and HIDDEN) are applied and logged once.
+local function set_detected(value, source)
+	if DetectionAlert.is_detected == value then
+		return
+	end
+	DetectionAlert.is_detected = value
+	log(string.format("[DetectionAlert] t=%.2f %s via %s", elapsed_time, value and "DETECTED" or "HIDDEN", source))
+end
+
+local function recompute_detection(source)
+	set_detected(wwise_detected or sampler_detected, source)
+end
+
+-- Status-only "enemies_searching": the Wwise alert-tier keywords (combat keywords set it too) or the
+-- sampler's lower activity tier. Does not touch is_detected/eye_color, only DetectionAlert.enemies_searching
+-- for the log/overlay.
+local function set_searching(value, source)
+	if DetectionAlert.enemies_searching == value then
+		return
+	end
+	DetectionAlert.enemies_searching = value
+	log(string.format("[DetectionAlert] t=%.2f enemies_searching=%s via %s", elapsed_time, tostring(value), source))
+end
+
+local function recompute_searching(source)
+	set_searching(wwise_searching or sampler_searching, source)
 end
 
 -- Probe: a read-only inventory of what this runtime exposes. It records names and types and
@@ -312,15 +307,41 @@ local function in_game_session()
 	return ok and session ~= nil
 end
 
--- Enemy sampler (read-only, shadow mode). While a game session is active it walks the main world's
--- units with engine getters only and counts them by resource name and animation state. It changes no
--- game state and does not drive the eye: the counts go to the heartbeat and a detail line every 30 s,
--- so the state names can be checked in game before anything depends on them. A full pass takes about
--- SAMPLE_PASS_SECONDS, spread over frames, with at most SAMPLE_MAX_UNITS_PER_FRAME units in one frame.
+-- Enemy sampler (read-only). While a game session is active it walks the main world's units with engine
+-- getters only and counts them by resource name and animation state. It changes no game state. Each
+-- completed pass also feeds the sampler detector below, which drives is_detected / enemies_searching.
+-- A full pass takes about SAMPLE_PASS_SECONDS, spread over frames, with at most SAMPLE_MAX_UNITS_PER_FRAME
+-- units in one frame.
 local SAMPLE_PASS_SECONDS = 5
 local SAMPLE_MAX_UNITS_PER_FRAME = 100
 local SAMPLE_DETAIL_INTERVAL_SECONDS = 30
 local SAMPLE_TOP_COUNT = 8
+
+-- Sampler detection. A pass's "active" value is its animation-state changes minus the ones from
+-- AMBIENT_HASHES. Detection is tiered, with hysteresis so the eye does not flicker:
+--   DETECTED  (drives the eye): active >= DETECT_ENTER in one pass, or >= DETECT_ENTER_PAIR in two passes
+--             in a row. Ends after DETECT_EXIT_PASSES passes in a row at or below DETECT_EXIT_AT_OR_BELOW.
+--   SEARCHING (status only):    active >= SEARCH_ENTER. Ends after SEARCH_EXIT_PASSES passes in a row at
+--             or below SEARCH_EXIT_AT_OR_BELOW. Always on while DETECTED.
+-- These are starting values from one logged session (one pass = SAMPLE_PASS_SECONDS), not tuned numbers.
+local SAMPLER_DETECTION = true -- false = the sampler only logs, as before
+local AMBIENT_HASHES = {
+	-- Unit resources that change state about once per pass whether or not anything is happening. Take hashes
+	-- from the "changes" lines in the log: one that shows up as =1 in almost every pass, calm or busy, belongs here.
+	["4d1c334d294dfa97"] = true,
+	-- Bursts in the ship/lobby only (4 changes in one pass, seen in both logs, never once a mission is running);
+	-- without this it turned "searching" on in the ship.
+	["685337c9ccf0e45c"] = true,
+}
+local DETECT_ENTER = 8
+local DETECT_ENTER_PAIR = 4 -- low on purpose: small skirmishes count as detection
+local DETECT_EXIT_AT_OR_BELOW = 3
+local DETECT_EXIT_PASSES = 3
+local SEARCH_ENTER = 5
+local SEARCH_EXIT_AT_OR_BELOW = 2
+local SEARCH_EXIT_PASSES = 2
+local MIN_ANIMATED_FOR_DETECTION = 20 -- fewer animated units than this is a loading screen, not a mission
+
 local game_session_active = false
 local next_sample_detail = nil
 local last_pass = nil
@@ -340,9 +361,77 @@ local sample_cursor = 1
 local sample_credit = 0
 local pass_units, pass_animated, pass_changed = 0, 0, 0
 local pass_cost = 0
+-- Changed units counted by resource hash for the current pass, written to the changes line.
+local pass_change_keys = {}
+-- The same changes as "hash:from>to" (animation-state numbers), to work out what the states mean.
+local pass_transitions = {}
 -- Counts since the last detail line, written every SAMPLE_DETAIL_INTERVAL_SECONDS.
 local detail_units, detail_animated, detail_changed = 0, 0, 0
 local detail_states, detail_resources = {}, {}
+
+-- Sampler detector state.
+local last_active = 0 -- "active" value of the previous completed pass (the pass being scored is not in it yet)
+local detect_low_passes = 0
+local search_low_passes = 0
+
+-- Turns one completed pass into the sampler's detection tiers.
+local function update_sampler_detection(active, animated)
+	if not SAMPLER_DETECTION then
+		return
+	end
+	if animated < MIN_ANIMATED_FOR_DETECTION then
+		active = 0
+	end
+
+	if not sampler_detected then
+		if active >= DETECT_ENTER or (active >= DETECT_ENTER_PAIR and last_active >= DETECT_ENTER_PAIR) then
+			sampler_detected = true
+			detect_low_passes = 0
+		end
+	elseif active <= DETECT_EXIT_AT_OR_BELOW then
+		detect_low_passes = detect_low_passes + 1
+		if detect_low_passes >= DETECT_EXIT_PASSES then
+			sampler_detected = false
+		end
+	else
+		detect_low_passes = 0
+	end
+
+	if sampler_detected then
+		sampler_searching = true
+		search_low_passes = 0
+	elseif not sampler_searching then
+		if active >= SEARCH_ENTER then
+			sampler_searching = true
+			search_low_passes = 0
+		end
+	elseif active <= SEARCH_EXIT_AT_OR_BELOW then
+		search_low_passes = search_low_passes + 1
+		if search_low_passes >= SEARCH_EXIT_PASSES then
+			sampler_searching = false
+		end
+	else
+		search_low_passes = 0
+	end
+
+	last_active = active
+	recompute_detection("sampler")
+	recompute_searching("sampler")
+end
+
+-- Clears the sampler's tiers when no game session is active, so a finished mission cannot leave the eye lit.
+local function reset_sampler_detection()
+	if pass_units > 0 then
+		pass_units, pass_animated, pass_changed, pass_cost = 0, 0, 0, 0
+		pass_change_keys = {}
+		pass_transitions = {}
+	end
+	sampler_detected, sampler_searching = false, false
+	last_active = 0
+	detect_low_passes, search_low_passes = 0, 0
+	recompute_detection("sampler (no session)")
+	recompute_searching("sampler (no session)")
+end
 
 -- Resolves stingray.<space>.<member> once; false marks a missing function.
 local function sample_fn(space_name, member)
@@ -386,7 +475,7 @@ local function count_into(counts, key)
 	counts[key] = (counts[key] or 0) + 1
 end
 
-local function top_counts(counts)
+local function top_counts(counts, limit)
 	local list = {}
 	for key, value in pairs(counts) do
 		list[#list + 1] = { key = key, value = value }
@@ -396,7 +485,7 @@ local function top_counts(counts)
 		return a.key < b.key
 	end)
 	local parts = {}
-	for index = 1, math.min(#list, SAMPLE_TOP_COUNT) do
+	for index = 1, math.min(#list, limit or SAMPLE_TOP_COUNT) do
 		parts[#parts + 1] = list[index].key .. "=" .. list[index].value
 	end
 	return #parts > 0 and table.concat(parts, " ") or "none"
@@ -451,6 +540,11 @@ local function resource_key(value, mode)
 	return type(value)
 end
 
+-- Resource ids are shortened to their 16-digit hash, so changed units can be matched to hash lists.
+local function short_resource_key(key)
+	return key:match("%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x") or (key:gsub("%s", "_"))
+end
+
 local function cpu_time()
 	if type(os) == "table" and type(os.clock) == "function" then
 		return os.clock()
@@ -458,13 +552,32 @@ local function cpu_time()
 	return 0
 end
 
--- Writes one line per completed pass; cost is the CPU time the sampler used during that pass.
+-- Writes one line per completed pass and feeds the pass to the detector. cost is the CPU time the sampler
+-- used during that pass; active is changed minus the AMBIENT_HASHES changes.
 local function log_pass(total)
+	local ambient = 0
+	for key, count in pairs(pass_change_keys) do
+		if AMBIENT_HASHES[key] then
+			ambient = ambient + count
+		end
+	end
+	local active = pass_changed - ambient
+	local ok, err = pcall(update_sampler_detection, active, pass_animated)
+	if not ok then
+		log_error("update_sampler_detection", err)
+	end
 
-	log(string.format("[DetectionAlert] pass t=%.1f wall=%s units=%d animated=%d changed=%d cost=%.1fms",
-		elapsed_time, wall_clock(), pass_units, pass_animated, pass_changed, pass_cost * 1000))
+	log(string.format("[DetectionAlert] pass t=%.1f wall=%s units=%d animated=%d changed=%d active=%d detected=%d searching=%d cost=%.1fms",
+		elapsed_time, wall_clock(), pass_units, pass_animated, pass_changed, active,
+		DetectionAlert.is_detected and 1 or 0, DetectionAlert.enemies_searching and 1 or 0, pass_cost * 1000))
+	if pass_changed > 0 then
+		log(string.format("[DetectionAlert] changes t=%.1f %s", elapsed_time, top_counts(pass_change_keys, math.huge)))
+		log(string.format("[DetectionAlert] transitions t=%.1f %s", elapsed_time, top_counts(pass_transitions, 16)))
+	end
 	last_pass = { total = total, units = pass_units, animated = pass_animated, changed = pass_changed }
 	pass_units, pass_animated, pass_changed, pass_cost = 0, 0, 0, 0
+	pass_change_keys = {}
+	pass_transitions = {}
 end
 
 -- Samples one unit: counts it into the pass and detail totals and records animation-state changes.
@@ -497,6 +610,12 @@ local function sample_unit(unit)
 			pass_changed = pass_changed + 1
 			detail_changed = detail_changed + 1
 			sample_changes_total = sample_changes_total + 1
+			local hash = "unkeyed"
+			if resource ~= nil and resource_mode ~= nil then
+				hash = short_resource_key(resource_key(resource, resource_mode))
+			end
+			count_into(pass_change_keys, hash)
+			count_into(pass_transitions, hash .. ":" .. previous .. ">" .. state)
 		end
 		last_state[unit] = state
 	end
@@ -553,71 +672,323 @@ local function sample_summary()
 	return string.format("total=%d/units=%d/animated=%d/changed=%d", s.total, s.units, s.animated, s.changed)
 end
 
--- Marker key: press F9 when a fight starts and again when it stops. Each press writes one MARKER line
--- with the wall clock, so the pass lines can be matched to the fight without relying on memory.
-local MARKER_KEY = "f9"
-local marker_key_id = nil
-local marker_key_ready = false
-local marker_key_down = false
-local active_marker = false
-local function log_marker_key_state()
-	log(string.format("[DetectionAlert] marker_key_ready=%s marker_key_down=%s", tostring(marker_key_ready), tostring(marker_key_down)))
-end
-local function poll_marker_key()
-	if not marker_key_ready and elapsed_time >= 1 then
-		marker_key_ready = true
-		marker_key_id = sample_call("Keyboard", "button_id", MARKER_KEY)
-		log(string.format("[DetectionAlert] marker key %s id=%s", MARKER_KEY, tostring(marker_key_id)))
-	end
-	if marker_key_id == nil then
-		return
-	end
-	local pressed = sample_call("Keyboard", "pressed", marker_key_id) == true
-	if pressed and not marker_key_down then
-		log_marker_key_state()
-		if not active_marker then
-			active_marker = true
-			log(string.format("[DetectionAlert] START MARKER t=%.1f wall=%s", elapsed_time, wall_clock()))
-		else
-			active_marker = false
-			log(string.format("[DetectionAlert] END MARKER t=%.1f wall=%s", elapsed_time, wall_clock()))
+-- Marker keys, for checking the detector against what you see in game: press MARKER_START_KEY when a fight
+-- starts and MARKER_END_KEY when it stops. They are two separate keys, so one missed press cannot turn every
+-- later START into an END the way the old single toggle key did. Each marker line carries the detector's
+-- state at that moment, and the pass lines before and after show how it got there.
+local MARKER_START_KEY = "f9"
+local MARKER_END_KEY = "f10"
+local marker_keys_ready = false
+local marker_keys = {
+	{ name = MARKER_START_KEY, label = "START MARKER", id = nil, down = false },
+	{ name = MARKER_END_KEY, label = "END MARKER", id = nil, down = false },
+}
+
+local function poll_marker_keys()
+	if not marker_keys_ready and elapsed_time >= 1 then
+		marker_keys_ready = true
+		for _, key in ipairs(marker_keys) do
+			key.id = sample_call("Keyboard", "button_id", key.name)
+			log(string.format("[DetectionAlert] marker key %s id=%s (%s)", key.name, tostring(key.id), key.label))
 		end
 	end
-	marker_key_down = pressed
+	for _, key in ipairs(marker_keys) do
+		if key.id ~= nil then
+			local pressed = sample_call("Keyboard", "pressed", key.id) == true
+			if pressed and not key.down then
+				log(string.format("[DetectionAlert] %s t=%.1f wall=%s last_active=%d detected=%d searching=%d",
+					key.label, elapsed_time, wall_clock(), last_active,
+					DetectionAlert.is_detected and 1 or 0, DetectionAlert.enemies_searching and 1 or 0))
+			end
+			key.down = pressed
+		end
+	end
 end
 
--- Two independent signals OR'd together: Wwise combat-audio keywords, and (when
--- HD2Runtime is installed) real combat events. Either one can drive the eye alert.
-local wwise_detected = false
-local wwise_searching = false
-local hd2_combat_active = false
+-- On-screen indicator. It is drawn the way P2P-Ping draws its list, with only the calls that mod runs on this
+-- build: World.create_screen_gui on the main world, then Gui.resolution, Gui.text, Gui.destroy_text and
+-- Gui.set_visible. No other draw call is used, because a bad native call cannot be caught by pcall. Text is only
+-- rebuilt when the state, the lines or the screen position change, and the gui is not touched while no game
+-- session is active (its world may be gone). It shows DETECTED / SEARCHING / HIDDEN from the same flags the
+-- status file carries, plus the sampler's last "active" value for tuning.
+local HUD_ENABLED = true
+local HUD_TOGGLE_KEY = "f11" -- shows/hides the indicator, like F8 does for P2P-Ping
+local HUD_X_FRACTION = 0.0375 -- from the left edge, as a share of the screen width (same column as P2P-Ping)
+local HUD_Y_FRACTION = 0.56 -- from the bottom, above P2P-Ping's list, which starts at 0.48
+local HUD_FONT = "core/performance_hud/debug"
+local HUD_FONT_SIZE = 26
+local HUD_SHOW_ACTIVE = true
+local HUD_MAX_FAULTS = 5
+local HUD_RETRY_SECONDS = 2
 
--- Compare before writing, so both directions (DETECTED and HIDDEN) are applied and logged once.
-local function set_detected(value, source)
-	if DetectionAlert.is_detected == value then
+local HUD_LOOK = {
+	detected = { text = "(O) DETECTED", r = 255, g = 112, b = 105 },
+	searching = { text = "(o) SEARCHING", r = 250, g = 207, b = 96 },
+	hidden = { text = "( ) HIDDEN", r = 112, g = 226, b = 145 },
+	info = { r = 238, g = 243, b = 235 },
+	shadow = { r = 12, g = 15, b = 18 },
+}
+
+local hud = {
+	visible = true,
+	faulted = false,
+	faults = 0,
+	gui = nil,
+	gui_world = nil,
+	ids = {}, -- line index -> { shadow = id, main = id }
+	cache = {}, -- line index -> what was last drawn, so unchanged lines are left alone
+	colors = {},
+	logged = {},
+	retry_at = 0,
+	toggle_ready = false,
+	toggle_id = nil,
+	toggle_down = false,
+}
+
+local function hud_log_once(key, text)
+	if not hud.logged[key] then
+		hud.logged[key] = true
+		log("[DetectionAlert] hud " .. text)
+	end
+end
+
+local function hud_engine(name)
+	local engine = rawget(_G, "stingray")
+	return type(engine) == "table" and rawget(engine, name) or nil
+end
+
+local function hud_color(name, look)
+	local cached = hud.colors[name]
+	if cached ~= nil then
+		return cached
+	end
+	local make = hud_engine("Color")
+	if make == nil then
+		return nil
+	end
+	local ok, made = pcall(make, 255, look.r, look.g, look.b)
+	if ok and made ~= nil then
+		hud.colors[name] = made
+		return made
+	end
+	return nil
+end
+
+local function hud_forget_text()
+	hud.ids, hud.cache = {}, {}
+end
+
+local function hud_clear_text(target_gui)
+	local destroy = sample_fn("Gui", "destroy_text")
+	if destroy and target_gui ~= nil then
+		for _, pair in pairs(hud.ids) do
+			if pair.shadow ~= nil then
+				pcall(destroy, target_gui, pair.shadow)
+			end
+			if pair.main ~= nil then
+				pcall(destroy, target_gui, pair.main)
+			end
+		end
+	end
+	hud_forget_text()
+end
+
+-- True only if the engine still lists the world, so a gui on a destroyed world is never touched.
+local function hud_world_is_live(world)
+	local worlds_fn = sample_fn("Application", "worlds")
+	if not worlds_fn or world == nil then
+		return false
+	end
+	local ok, worlds = pcall(worlds_fn)
+	if not ok or type(worlds) ~= "table" then
+		return false
+	end
+	for index = 1, #worlds do
+		if worlds[index] == world then
+			return true
+		end
+	end
+	return false
+end
+
+local function hud_get_gui(game_world)
+	if hud.gui ~= nil and hud.gui_world == game_world then
+		return hud.gui
+	end
+	if hud.gui ~= nil then
+		if hud_world_is_live(hud.gui_world) then
+			hud_clear_text(hud.gui)
+			local destroy_gui = sample_fn("World", "destroy_gui")
+			if destroy_gui then
+				pcall(destroy_gui, hud.gui_world, hud.gui)
+			end
+		end
+		hud.gui, hud.gui_world = nil, nil
+		hud_forget_text()
+	end
+	local create = sample_fn("World", "create_screen_gui")
+	if not create then
+		hud_log_once("no_screen_gui", "World.create_screen_gui is missing")
+		return nil
+	end
+	local ok, made = pcall(create, game_world, "scale", 1, 1)
+	if not ok or made == nil then
+		hud_log_once("gui_failed", "screen gui create failed: " .. tostring(made))
+		return nil
+	end
+	hud.gui, hud.gui_world = made, game_world
+	hud_log_once("gui_created", "screen gui created on the main world")
+	return made
+end
+
+local function hud_lines()
+	local state = DetectionAlert.is_detected and "detected" or (DetectionAlert.enemies_searching and "searching" or "hidden")
+	local look = HUD_LOOK[state]
+	local lines = { { text = look.text, key = state, look = look } }
+	if HUD_SHOW_ACTIVE then
+		lines[2] = { text = "ACTIVE " .. tostring(last_active), key = "info", look = HUD_LOOK.info }
+	end
+	return lines
+end
+
+local function hud_draw()
+	local resolution = sample_fn("Gui", "resolution")
+	local text_fn = sample_fn("Gui", "text")
+	local Vector2 = hud_engine("Vector2")
+	if not resolution or not text_fn or Vector2 == nil then
+		hud_log_once("api_missing", string.format("draw api missing: resolution=%s text=%s vector2=%s",
+			tostring(resolution ~= nil), tostring(text_fn ~= nil), tostring(Vector2 ~= nil)))
 		return
 	end
-	DetectionAlert.is_detected = value
-	log_important(string.format("[DetectionAlert] t=%.2f %s via %s", elapsed_time, value and "DETECTED" or "HIDDEN", source))
-end
-
-local function recompute_detection(source)
-	set_detected(wwise_detected or hd2_combat_active, source)
-end
-
--- Status-only "enemies_searching": the lighter Wwise alert-tier keywords, or anything
--- that already implies full combat (which implies awareness too). Does not touch
--- is_detected/eye_color, only DetectionAlert.enemies_searching for the log/overlay.
-local function set_searching(value, source)
-	if DetectionAlert.enemies_searching == value then
+	if elapsed_time < hud.retry_at then
 		return
 	end
-	DetectionAlert.enemies_searching = value
-	log(string.format("[DetectionAlert] t=%.2f enemies_searching=%s via %s", elapsed_time, tostring(value), source))
+	local game_world = sample_call("Application", "main_world")
+	if game_world == nil then
+		return
+	end
+	local target_gui = hud_get_gui(game_world)
+	if target_gui == nil then
+		hud.retry_at = elapsed_time + HUD_RETRY_SECONDS
+		return
+	end
+	local set_visible = sample_fn("Gui", "set_visible")
+	if set_visible then
+		pcall(set_visible, target_gui, true)
+	end
+	local ok, width, height = pcall(resolution)
+	if not ok or type(width) ~= "number" or type(height) ~= "number" or width <= 0 or height <= 0 then
+		hud_log_once("resolution", "resolution unavailable")
+		return
+	end
+	hud_log_once("resolution", string.format("resolution=%dx%d", width, height))
+
+	local x = math.floor(math.max(24, width * HUD_X_FRACTION) + 0.5)
+	local y = math.floor(height * HUD_Y_FRACTION + 0.5)
+	local destroy = sample_fn("Gui", "destroy_text")
+	local lines = hud_lines()
+	for index, line in ipairs(lines) do
+		local py = y - (index - 1) * (HUD_FONT_SIZE + 6)
+		local cached = hud.cache[index]
+		local pair = hud.ids[index] or {}
+		if cached == nil or cached.text ~= line.text or cached.key ~= line.key or cached.x ~= x or cached.y ~= py
+			or pair.shadow == nil or pair.main == nil then
+			if destroy then
+				if pair.shadow ~= nil then
+					pcall(destroy, target_gui, pair.shadow)
+				end
+				if pair.main ~= nil then
+					pcall(destroy, target_gui, pair.main)
+				end
+			end
+			local ok_shadow, shadow_pos = pcall(Vector2, x + 1, py - 1)
+			local ok_main, main_pos = pcall(Vector2, x, py)
+			local shadow_color = hud_color("shadow", HUD_LOOK.shadow)
+			local main_color = hud_color(line.key, line.look)
+			pair = {}
+			if ok_shadow and shadow_pos ~= nil and shadow_color ~= nil then
+				local drawn, id = pcall(text_fn, target_gui, line.text, HUD_FONT, HUD_FONT_SIZE, HUD_FONT, shadow_pos, shadow_color)
+				if drawn then
+					pair.shadow = id
+				else
+					hud_log_once("text_failed", "text call failed: " .. tostring(id))
+				end
+			end
+			if ok_main and main_pos ~= nil and main_color ~= nil then
+				local drawn, id = pcall(text_fn, target_gui, line.text, HUD_FONT, HUD_FONT_SIZE, HUD_FONT, main_pos, main_color)
+				if drawn then
+					pair.main = id
+					hud_log_once("text_ok", "text call ok")
+				else
+					hud_log_once("text_failed", "text call failed: " .. tostring(id))
+				end
+			end
+			hud.ids[index] = pair
+			hud.cache[index] = { text = line.text, key = line.key, x = x, y = py }
+		end
+	end
+	for index in pairs(hud.ids) do
+		if type(index) == "number" and index > #lines then
+			local pair = hud.ids[index]
+			if destroy then
+				if pair.shadow ~= nil then
+					pcall(destroy, target_gui, pair.shadow)
+				end
+				if pair.main ~= nil then
+					pcall(destroy, target_gui, pair.main)
+				end
+			end
+			hud.ids[index], hud.cache[index] = nil, nil
+		end
+	end
 end
 
-local function recompute_searching(source)
-	set_searching(wwise_searching or hd2_combat_active, source)
+local function hud_poll_toggle()
+	if not hud.toggle_ready and elapsed_time >= 1 then
+		hud.toggle_ready = true
+		hud.toggle_id = sample_call("Keyboard", "button_id", HUD_TOGGLE_KEY)
+		log(string.format("[DetectionAlert] hud toggle key %s id=%s", HUD_TOGGLE_KEY, tostring(hud.toggle_id)))
+	end
+	if hud.toggle_id == nil then
+		return
+	end
+	local pressed = sample_call("Keyboard", "pressed", hud.toggle_id) == true
+	if pressed and not hud.toggle_down then
+		hud.visible = not hud.visible
+		if not hud.visible and hud.gui ~= nil and game_session_active then
+			hud_clear_text(hud.gui)
+			local set_visible = sample_fn("Gui", "set_visible")
+			if set_visible then
+				pcall(set_visible, hud.gui, false)
+			end
+		end
+		log(string.format("[DetectionAlert] hud visible=%s (toggle key %s)", tostring(hud.visible), HUD_TOGGLE_KEY))
+	end
+	hud.toggle_down = pressed
+end
+
+local function hud_tick()
+	hud_poll_toggle()
+	if game_session_active and hud.visible then
+		hud_draw()
+	end
+end
+
+-- A fault drops our references (the gui is rebuilt on the next draw); too many in a row disarms the indicator.
+local function hud_guarded_tick()
+	local ok, err = pcall(hud_tick)
+	if ok then
+		hud.faults = 0
+		return
+	end
+	hud.faults = hud.faults + 1
+	log_error("hud", err)
+	hud.gui, hud.gui_world = nil, nil
+	hud_forget_text()
+	if hud.faults >= HUD_MAX_FAULTS then
+		hud.faulted = true
+		log("[DetectionAlert] hud disarmed after repeated errors; detection and logging are unaffected")
+	end
 end
 
 -- Best-effort class name for table/userdata values via common metatable conventions.
@@ -739,7 +1110,7 @@ local function hook_wwise_table(table_name, callbacks)
 		end
 	end
 	table.sort(names)
-	log_important(string.format("[DetectionAlert] %s: wrapped %d function(s), %d detection-signal; members: %s",
+	log(string.format("[DetectionAlert] %s: wrapped %d function(s), %d detection-signal; members: %s",
 		table_name, hooked, signals, table.concat(names, ", ")))
 end
 
@@ -751,7 +1122,7 @@ local function sync_wwise_hooks()
 		if type(callbacks) ~= "table" then
 			if not wwise_missing_logged[table_name] then
 				wwise_missing_logged[table_name] = true
-				log_important("[DetectionAlert] " .. table_name .. " not found yet; retrying every " .. WWISE_SYNC_INTERVAL_SECONDS .. " s")
+				log("[DetectionAlert] " .. table_name .. " not found yet; retrying every " .. WWISE_SYNC_INTERVAL_SECONDS .. " s")
 			end
 		elseif has_unhooked_callbacks(callbacks) then
 			hook_wwise_table(table_name, callbacks)
@@ -779,6 +1150,22 @@ local function open_status_file()
 	end
 end
 
+-- Fills the public counts. AggroCounter's own numbers are used only when it is live; otherwise -1 says "not available"
+-- (not zero, so an overlay does not show "0 enemies searching" while nothing is being counted).
+local function refresh_counts()
+	local counts = aggro_counts()
+	if counts and type(counts.search) == "number" and type(counts.me) == "number" then
+		DetectionAlert.search_count = math.floor(counts.search)
+		DetectionAlert.detect_count = math.floor(counts.me)
+		DetectionAlert.count_source = "aggro"
+	else
+		DetectionAlert.search_count = -1
+		DetectionAlert.detect_count = -1
+		DetectionAlert.count_source = "none"
+	end
+	DetectionAlert.active_units = last_active
+end
+
 local function write_status()
 	if status_file == nil then
 		open_status_file()
@@ -790,15 +1177,22 @@ local function write_status()
 		return
 	end
 
+	local ok_counts, counts_err = pcall(refresh_counts)
+	if not ok_counts then
+		log_error("refresh_counts", counts_err)
+	end
 	local c = DetectionAlert.eye_color or EYE_COLOR_IDLE
 	local line = string.format(
-		"t=%.2f detected=%d intensity=%.3f r=%.3f g=%.3f b=%.3f nearby=%d searching=%d",
+		"t=%.2f detected=%d intensity=%.3f r=%.3f g=%.3f b=%.3f searching=%d search_count=%d detect_count=%d active_units=%d count_source=%s",
 		elapsed_time,
 		DetectionAlert.is_detected and 1 or 0,
 		DetectionAlert.eye_intensity,
 		c.r, c.g, c.b,
-		DetectionAlert.enemies_nearby and 1 or 0,
-		DetectionAlert.enemies_searching and 1 or 0
+		DetectionAlert.enemies_searching and 1 or 0,
+		DetectionAlert.search_count,
+		DetectionAlert.detect_count,
+		DetectionAlert.active_units,
+		DetectionAlert.count_source
 	)
 	local ok, err = pcall(write_line, status_file, line)
 	if ok then
@@ -812,223 +1206,22 @@ local function write_status()
 	end
 end
 
--- A combat event resets the decay timer and flips hd2_combat_active on immediately;
--- tick() below decays it back off after HD2_COMBAT_TIMEOUT_SECONDS of quiet.
-local HD2_COMBAT_TIMEOUT_SECONDS = 8
-local hd2_last_combat_time = -math.huge
-
-local function mark_hd2_combat(label)
-	hd2_last_combat_time = elapsed_time
-	if not hd2_combat_active then
-		hd2_combat_active = true
-		recompute_detection(label)
-	end
-	recompute_searching(label)
-end
-
--- HD2Runtime has no pre-fire event (it patches no game code) and no attacker identity
--- for NPC-caused damage (only player-credited hits carry a creditor). So "an Automaton
--- turret is about to fire" can't be detected or attributed directly. This instead
--- flashes when the player takes damage with no identifiable player attacker while a
--- tracked Automaton turret structure is within range: a reactive, approximate proxy.
-local HD2_TURRET_RANGE_METERS = 60 -- heuristic guess, not a published engagement range
-local hd2_nearby_turrets = {} -- entity_id -> HD2EntityHandle
-
--- Status-only "enemies_nearby": any tracked hostile entity (any faction, event.enemy ==
--- true) within range of the player. Separate from the turret tracking above, which
--- exists for the near-turret damage flash, not for this status.
-local HD2_ENEMY_NEARBY_RANGE_METERS = 30 -- heuristic guess, not a published aggro range
-local hd2_nearby_enemies = {} -- entity_id -> HD2EntityHandle
-
-local function is_turret_structure(event)
-	if event.faction ~= "automatons" then
-		return false
-	end
-	local haystack = ((event.name or "") .. " " .. (event.semantic_id or "")):lower()
-	return haystack:find("turret", 1, true) ~= nil
-end
-
--- Shared proximity check: true if any valid, tracked entity in `entities` is within
--- `range_meters` of the local player. Prunes entries that are no longer valid.
-local function player_near_any(entities, range_meters)
-	if not hd2_ok then
-		return false
-	end
-	local player = hd2.local_player()
-	local here = player and player:position()
-	if not here then
-		return false
-	end
-
-	for entity_id, entity in pairs(entities) do
-		if entity:is_valid() then
-			local there = entity:position()
-			if there and here:distance(there) <= range_meters then
-				return true
-			end
-		else
-			entities[entity_id] = nil
-		end
-	end
-	return false
-end
-
-local function player_near_any_turret()
-	return player_near_any(hd2_nearby_turrets, HD2_TURRET_RANGE_METERS)
-end
-
-local function player_near_any_enemy()
-	return player_near_any(hd2_nearby_enemies, HD2_ENEMY_NEARBY_RANGE_METERS)
-end
-
-local last_flash_log = -math.huge
-
--- Every HD2 handler runs through guarded(): an error is logged under the event's name and
--- cannot stop the other subscriptions.
-local function guarded(label, handler)
-	return function(event)
-		local ok, err = pcall(handler, event)
-		if not ok then
-			log_error(label, err)
-		end
-	end
-end
-
-local function on_player_damaged(event)
-	mark_hd2_combat("hd2:player_damaged")
-	if not event.local_attacker and player_near_any_turret() then
-		flash_eye_now()
-		if elapsed_time - last_flash_log >= 1 then
-			last_flash_log = elapsed_time
-			log(string.format("[DetectionAlert] t=%.2f near-turret damage flash", elapsed_time))
-		end
-	end
-end
-
-local function on_entity_damaged(event)
-	if event.local_attacker then
-		mark_hd2_combat("hd2:entity_damaged")
-	end
-end
-
-local function on_entity_killed(event)
-	if event.local_killer then
-		mark_hd2_combat("hd2:entity_killed")
-	end
-end
-
-local function on_entity_spawned(event)
-	if event.entity_id == nil or event.entity == nil then
-		return
-	end
-	if is_turret_structure(event) then
-		hd2_nearby_turrets[event.entity_id] = event.entity
-		log(string.format("[DetectionAlert] t=%.2f tracking turret %s (id %s)", elapsed_time, tostring(event.semantic_id), tostring(event.entity_id)))
-	end
-	if event.enemy then
-		hd2_nearby_enemies[event.entity_id] = event.entity
-	end
-end
-
-local function on_entity_died(event)
-	if event.entity_id ~= nil then
-		hd2_nearby_turrets[event.entity_id] = nil
-		hd2_nearby_enemies[event.entity_id] = nil
-	end
-end
-
-local function on_mission_ended()
-	hd2_combat_active = false
-	hd2_last_combat_time = -math.huge
-	hd2_nearby_turrets = {}
-	hd2_nearby_enemies = {}
-	wwise_detected = false
-	wwise_searching = false
-	DetectionAlert.enemies_nearby = false
-	log_important(string.format("[DetectionAlert] t=%.2f mission ended: clearing combat state", elapsed_time))
-	recompute_detection("hd2:mission_ended")
-	recompute_searching("hd2:mission_ended")
-end
-
--- Subscribes through the mod context, so the handler is attributed to this mod. The returned
--- state (active, or rejected/failed with a reason) is logged so a refused event is visible.
-local function subscribe(name, handler)
-	local ok, sub = pcall(hd2_mod.on, hd2_mod, name, guarded(name, handler), { id = "detection_alert_" .. name })
-	if not ok then
-		log_important(string.format("[DetectionAlert] subscribe %s FAILED: %s", name, tostring(sub)))
-		return false
-	end
-	local state = type(sub) == "table" and sub.state or "unknown"
-	local reason = type(sub) == "table" and sub.reason or nil
-	log_important(string.format("[DetectionAlert] subscribed %s: state=%s%s", name, tostring(state),
-		reason and (" reason=" .. tostring(reason)) or ""))
-	return true
-end
-
-local function hook_hd2_events()
-	if not hd2_ok then
-		log_important("[DetectionAlert] HD2Runtime not available (" .. tostring(hd2_load_error) .. "); Wwise heuristic only")
-		return false
-	end
-	if not hd2_mod then
-		log_important("[DetectionAlert] HD2Runtime loaded but hd2.mod(MOD_ID) failed: " .. tostring(hd2_mod_error))
-		return false
-	end
-
-	local subscriptions = {
-		{ "player_damaged", on_player_damaged },
-		{ "entity_damaged", on_entity_damaged },
-		{ "entity_killed", on_entity_killed },
-		{ "entity_spawned", on_entity_spawned },
-		{ "entity_died", on_entity_died },
-		{ "mission_ended", on_mission_ended },
-	}
-	local all_ok = true
-	for _, entry in ipairs(subscriptions) do
-		if not subscribe(entry[1], entry[2]) then
-			all_ok = false
-		end
-	end
-	return all_ok
-end
-
-local NEARBY_CHECK_INTERVAL_SECONDS = 0.25
-local last_nearby_check = -math.huge
 local next_wwise_sync = 0
 local next_heartbeat = HEARTBEAT_INTERVAL_SECONDS
 
-local function count_entries(entries)
-	local n = 0
-	for _ in pairs(entries) do
-		n = n + 1
-	end
-	return n
-end
-
 local function heartbeat()
-	local game_state = "n/a"
-	if hd2_ok then
-		local ok, state = pcall(hd2.game_state)
-		if ok and type(state) == "table" then
-			game_state = tostring(state.name)
-		end
-	end
 	log(string.format(
-		"[DetectionAlert] t=%.1f heartbeat detected=%s searching=%s nearby=%s hd2_combat=%s game_state=%s turrets=%d enemies=%d wwise_calls=%d wwise_signal_calls=%d wwise_matches=%d errors=%d aggro=%s sample=%s status_bytes=%d",
+		"[DetectionAlert] t=%.1f heartbeat detected=%s searching=%s wwise_calls=%d wwise_signal_calls=%d wwise_matches=%d errors=%d aggro=%s sample=%s active=%d status_bytes=%d",
 		elapsed_time,
 		tostring(DetectionAlert.is_detected),
 		tostring(DetectionAlert.enemies_searching),
-		tostring(DetectionAlert.enemies_nearby),
-		tostring(hd2_combat_active),
-		game_state,
-		count_entries(hd2_nearby_turrets),
-		count_entries(hd2_nearby_enemies),
 		wwise_total_calls,
 		wwise_signal_calls,
 		wwise_signal_matches,
 		error_count,
 		aggro_summary(),
 		sample_summary(),
+		last_active,
 		status_bytes
 	))
 end
@@ -1039,26 +1232,9 @@ local function tick(dt)
 	-- Pending: once a real turret light/material draw call is confirmed, call it here
 	-- with DetectionAlert.eye_color / DetectionAlert.eye_intensity.
 
-	-- enemies_nearby needs live positions, so it has its own throttle instead of running per event.
-	if hd2_ok and elapsed_time - last_nearby_check >= NEARBY_CHECK_INTERVAL_SECONDS then
-		last_nearby_check = elapsed_time
-		local ok, nearby = pcall(player_near_any_enemy)
-		if ok then
-			DetectionAlert.enemies_nearby = nearby
-		else
-			log_error("enemies_nearby", nearby)
-		end
-	end
-
 	if elapsed_time - last_status_write >= STATUS_WRITE_INTERVAL_SECONDS then
 		last_status_write = elapsed_time
 		write_status()
-	end
-
-	if hd2_combat_active and (elapsed_time - hd2_last_combat_time) >= HD2_COMBAT_TIMEOUT_SECONDS then
-		hd2_combat_active = false
-		recompute_detection("hd2:timeout")
-		recompute_searching("hd2:timeout")
 	end
 
 	if elapsed_time >= next_wwise_sync then
@@ -1074,7 +1250,10 @@ local function tick(dt)
 		heartbeat()
 	end
 
-	poll_marker_key()
+	local marker_ok, marker_err = pcall(poll_marker_keys)
+	if not marker_ok then
+		log_error("poll_marker_keys", marker_err)
+	end
 
 	if elapsed_time >= next_session_check then
 		next_session_check = elapsed_time + 1
@@ -1093,6 +1272,10 @@ local function tick(dt)
 		last_pass = nil
 		sample_units = nil
 		sample_credit = 0
+		local ok, err = pcall(reset_sampler_detection)
+		if not ok then
+			log_error("reset_sampler_detection", err)
+		end
 	else
 		local started = cpu_time()
 		local ok, err = pcall(sample_enemies, dt)
@@ -1100,6 +1283,10 @@ local function tick(dt)
 		if not ok then
 			log_error("sampler", err)
 		end
+	end
+
+	if HUD_ENABLED and not hud.faulted then
+		hud_guarded_tick()
 	end
 
 	if probe_index <= #PROBE_TIMES and elapsed_time >= PROBE_TIMES[probe_index] then
@@ -1124,7 +1311,7 @@ local function install_update_hook()
 			log_error("update tick", err)
 		end
 	end
-	log_important("[DetectionAlert] update hook installed; previous update() " .. (previous_update and "chained" or "absent"))
+	log("[DetectionAlert] update hook installed; previous update() " .. (previous_update and "chained" or "absent"))
 end
 
 local function report_environment()
@@ -1132,8 +1319,8 @@ local function report_environment()
 		return type(rawget(_G, name))
 	end
 	local loader = rawget(_G, "CowboyBingusModLoader")
-	log_important(string.format("[DetectionAlert] start: %s, t=%.2f", tostring(_VERSION), elapsed_time))
-	log_important(string.format(
+	log(string.format("[DetectionAlert] start: %s, t=%.2f", tostring(_VERSION), elapsed_time))
+	log(string.format(
 		"[DetectionAlert] env: CowboyBingusModLoader=%s open_log=%s WwiseFlowCallbacks=%s WwiseVisualization=%s update=%s io=%s os.getenv=%s",
 		kind("CowboyBingusModLoader"),
 		type(loader) == "table" and type(loader.open_log) or "n/a",
@@ -1143,27 +1330,24 @@ local function report_environment()
 		kind("io"),
 		(type(os) == "table" and type(os.getenv)) or "n/a"
 	))
-	if hd2_ok then
-		log_important("[DetectionAlert] HD2Runtime: loaded; hd2.mod context " .. (hd2_mod and "ready" or ("failed: " .. tostring(hd2_mod_error))))
-	else
-		log_important("[DetectionAlert] HD2Runtime: not loaded (" .. tostring(hd2_load_error) .. ")")
-	end
-	log_important("[DetectionAlert] log file: " .. tostring(log_target))
+	log("[DetectionAlert] log file: " .. tostring(log_target))
+	log(string.format(
+		"[DetectionAlert] sampler detection=%s detect_enter=%d/%d detect_exit=%d x%d search_enter=%d search_exit=%d x%d markers: %s=start %s=end",
+		tostring(SAMPLER_DETECTION), DETECT_ENTER, DETECT_ENTER_PAIR, DETECT_EXIT_AT_OR_BELOW, DETECT_EXIT_PASSES,
+		SEARCH_ENTER, SEARCH_EXIT_AT_OR_BELOW, SEARCH_EXIT_PASSES, MARKER_START_KEY, MARKER_END_KEY
+	))
+	log(string.format("[DetectionAlert] hud enabled=%s toggle=%s x=%.4f y=%.2f size=%d show_active=%s",
+		tostring(HUD_ENABLED), HUD_TOGGLE_KEY, HUD_X_FRACTION, HUD_Y_FRACTION, HUD_FONT_SIZE, tostring(HUD_SHOW_ACTIVE)))
 end
 
 report_environment()
 install_update_hook()
-
-local hd2_ok_hooks, hd2_hook_error = pcall(hook_hd2_events)
-if not hd2_ok_hooks then
-	log_error("hook_hd2_events", hd2_hook_error)
-end
 
 local wwise_ok, wwise_error = pcall(sync_wwise_hooks)
 if not wwise_ok then
 	log_error("sync_wwise_hooks", wwise_error)
 end
 
-log_important(string.format("[DetectionAlert] startup done: status every %.1f s, heartbeat every %d s", STATUS_WRITE_INTERVAL_SECONDS, HEARTBEAT_INTERVAL_SECONDS))
+log(string.format("[DetectionAlert] startup done: status every %.1f s, heartbeat every %d s", STATUS_WRITE_INTERVAL_SECONDS, HEARTBEAT_INTERVAL_SECONDS))
 
 return DetectionAlert
