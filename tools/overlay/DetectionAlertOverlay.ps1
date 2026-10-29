@@ -9,10 +9,12 @@
     tick, throttled). This script polls that file's last line and renders a small
     borderless, always-on-top window showing the turret eye glow outside the game window.
 
-    Below the state label it shows how many enemies are searching and how many have detected
-    you. Those two numbers come from AggroCounter and read "n/a" while AggroCounter is off
-    (it is off on plain Lua 5.1 builds). "active units" is always shown: the number of units whose
-    animation changed in the last sampler pass. It measures activity, not enemies that saw you.
+    Below the state label it shows "alerted enemies": animated enemy units currently outside their
+    calm animation states (the mod learns each enemy type's calm states during quiet stretches, so it
+    reads 0 for the first minute or so). It is a count of enemies doing something other than their
+    calm behaviour anywhere in the world; it cannot tell searching from detected-you. "active units"
+    is the number of units whose animation changed in the last sampler pass. When AggroCounter is
+    running, its own searching / detected-you numbers are shown too.
 
 .USAGE
     powershell -ExecutionPolicy Bypass -File tools\overlay\DetectionAlertOverlay.ps1
@@ -134,7 +136,7 @@ function Parse-StatusLine([string]$line) {
     # searching, the count fields and nearby are all optional, so older log lines (written before
     # those fields existed) still parse; the nearby value is no longer shown. A count of -1 means
     # the mod has no real number (AggroCounter off).
-    $pattern = 't=(?<t>[\d.\-]+) detected=(?<d>[01]) intensity=(?<i>[\d.\-]+) r=(?<r>[\d.\-]+) g=(?<g>[\d.\-]+) b=(?<b>[\d.\-]+)(?: nearby=[01])?(?: searching=(?<s>[01]))?(?: search_count=(?<sc>-?\d+))?(?: detect_count=(?<dc>-?\d+))?(?: active_units=(?<au>-?\d+))?(?: count_source=(?<cs>\w+))?'
+    $pattern = 't=(?<t>[\d.\-]+) detected=(?<d>[01]) intensity=(?<i>[\d.\-]+) r=(?<r>[\d.\-]+) g=(?<g>[\d.\-]+) b=(?<b>[\d.\-]+)(?: nearby=[01])?(?: searching=(?<s>[01]))?(?: search_count=(?<sc>-?\d+))?(?: detect_count=(?<dc>-?\d+))?(?: active_units=(?<au>-?\d+))?(?: count_source=(?<cs>\w+))?(?: alerted_units=(?<al>-?\d+))?(?: team_alerted=(?<ta>-?\d+))?(?: team_mode=(?<tm>\w+))?'
     $match = [regex]::Match($line, $pattern)
     if (-not $match.Success) { return $null }
     return [PSCustomObject]@{
@@ -148,16 +150,23 @@ function Parse-StatusLine([string]$line) {
         DetectCount = $(if ($match.Groups['dc'].Success) { [int]$match.Groups['dc'].Value } else { -1 })
         ActiveUnits = $(if ($match.Groups['au'].Success) { [int]$match.Groups['au'].Value } else { $null })
         CountSource = $(if ($match.Groups['cs'].Success) { $match.Groups['cs'].Value } else { 'none' })
+        AlertedUnits = $(if ($match.Groups['al'].Success) { [int]$match.Groups['al'].Value } else { $null })
+        TeamAlerted = $(if ($match.Groups['ta'].Success) { [int]$match.Groups['ta'].Value } else { $null })
+        TeamMode = $(if ($match.Groups['tm'].Success) { $match.Groups['tm'].Value } else { 'off' })
     }
 }
 
-# "n/a" unless AggroCounter supplied real numbers; active units are always shown when the mod reports them.
+# Two lines. "alerted" is enemies near you; "team" is enemies busy around your squadmates, and reads "?" unless
+# the mod positively identified which player unit is you (team_mode=me). AggroCounter's own numbers are added
+# only while it is running. 'ready' is the pre-split name for 'me' and is accepted so older logs still read.
 function Format-Counts($status) {
-    $activeText = if ($null -ne $status.ActiveUnits) { "active units: $($status.ActiveUnits)" } else { 'active units: -' }
+    $alerted = if ($null -ne $status.AlertedUnits) { "$($status.AlertedUnits)" } else { '-' }
+    $team = if (($status.TeamMode -eq 'me' -or $status.TeamMode -eq 'ready') -and $null -ne $status.TeamAlerted) { "$($status.TeamAlerted)" } elseif ($status.TeamMode -eq 'off') { 'off' } else { '?' }
+    $active = if ($null -ne $status.ActiveUnits) { "$($status.ActiveUnits)" } else { '-' }
     if ($status.CountSource -eq 'aggro' -and $status.SearchCount -ge 0 -and $status.DetectCount -ge 0) {
-        return "searching: $($status.SearchCount)   detected you: $($status.DetectCount)`n$activeText"
+        return "searching: $($status.SearchCount)   detected you: $($status.DetectCount)`nalerted: $alerted   team: $team   active: $active"
     }
-    return "searching: n/a   detected you: n/a`n$activeText"
+    return "alerted: $alerted   team: $team`nactive: $active"
 }
 
 $lastSeenAt = Get-Date
