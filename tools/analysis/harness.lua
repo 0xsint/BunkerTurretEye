@@ -94,8 +94,31 @@ local function make_stingray(world)
 		},
 		World = {
 			units = function(w) return w.units end,
-			create_screen_gui = function() return nil end,
+			-- A screen gui that records what was drawn, so the HUD layout can be asserted. Set
+			-- world.gui_api = false for a build where the draw path is missing.
+			create_screen_gui = function(w)
+				if w.gui_api == false then
+					return nil
+				end
+				w.gui = w.gui or { texts = {}, next_id = 0 }
+				return w.gui
+			end,
+			destroy_gui = function(w) w.gui = nil end,
 		},
+		-- The five Gui calls the mod is willing to make, and nothing else.
+		Gui = {
+			resolution = function() return world.screen_width or 1920, world.screen_height or 1080 end,
+			text = function(gui, text, font, size, material, position, color)
+				gui.next_id = gui.next_id + 1
+				gui.texts[gui.next_id] = { text = text, font = font, size = size,
+					x = position[1], y = position[2], color = color }
+				return gui.next_id
+			end,
+			destroy_text = function(gui, id) gui.texts[id] = nil end,
+			set_visible = function() end,
+		},
+		Vector2 = function(x, y) return { x, y } end,
+		Color = function(a, r, g, b) return { a = a, r = r, g = g, b = b } end,
 		Unit = {
 			alive = function(u) return type(u) == "table" and u.alive == true end,
 			resource_name = function(u) return u.resource end,

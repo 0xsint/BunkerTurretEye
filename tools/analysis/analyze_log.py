@@ -16,9 +16,20 @@ PASS_V1_RE = re.compile(
     r"changed=(?P<changed>\d+) active=(?P<active>-?\d+) alerted=(?P<alerted>\d+) team=(?P<team>\d+) "
     r"far=(?P<loose>\d+) detected=(?P<detected>\d+) searching=(?P<searching>\d+) cost=(?P<cost>[\d.]+)ms"
 )
-# The current pass line, with activity attributed to you or to a squadmate.
+# The pre-whitelist pass line: activity attributed to you or a squadmate, but no enemy counts.
 PASS_V2_RE = re.compile(
     r"pass t=(?P<t>[\d.]+) wall=\S+ units=(?P<units>\d+) animated=(?P<animated>\d+) "
+    r"changed=(?P<changed>\d+) ambient=(?P<ambient>\d+) me=(?P<active>\d+) mate=(?P<mate>\d+) "
+    r"loose=(?P<loose>\d+) unplaced=(?P<unplaced>\d+) unanchored=(?P<unanchored>\d+) "
+    r"alerted_me=(?P<alerted>\d+) "
+    r"alerted_mate=(?P<alerted_mate>\d+) detected=(?P<detected>\d+) searching=(?P<searching>\d+) "
+    r"team=(?P<team>\d+) cost=(?P<cost>[\d.]+)ms"
+)
+# The current pass line. `enemies`, `near_me` and `near_mate` are real counts of units whose resource
+# is in the mod's ENEMY whitelist; everything else is unchanged from V2.
+PASS_V3_RE = re.compile(
+    r"pass t=(?P<t>[\d.]+) wall=\S+ units=(?P<units>\d+) animated=(?P<animated>\d+) "
+    r"enemies=(?P<enemies>\d+) near_me=(?P<near_me>\d+) near_mate=(?P<near_mate>\d+) "
     r"changed=(?P<changed>\d+) ambient=(?P<ambient>\d+) me=(?P<active>\d+) mate=(?P<mate>\d+) "
     r"loose=(?P<loose>\d+) unplaced=(?P<unplaced>\d+) unanchored=(?P<unanchored>\d+) "
     r"alerted_me=(?P<alerted>\d+) "
@@ -52,7 +63,7 @@ def parse(path):
     change_lines = 0
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
-            m = PASS_V2_RE.search(line) or PASS_V1_RE.search(line)
+            m = PASS_V3_RE.search(line) or PASS_V2_RE.search(line) or PASS_V1_RE.search(line)
             if m:
                 row = {k: (float(v) if "." in v else int(v)) for k, v in m.groupdict().items()}
                 row.setdefault("mate", 0)
@@ -174,6 +185,14 @@ def main(path):
         print(f"  {label:12s} detected: {stats(det, key)}")
         print(f"  {label:12s} hidden  : {stats(hid, key)}")
 
+    # Only logs written since the ENEMY whitelist landed carry real enemy counts.
+    counted = [p for p in mission if "enemies" in p]
+    if counted:
+        print(f"\nenemy counts (whitelisted resources, {len(counted)} mission passes):")
+        for key in ("enemies", "near_me", "near_mate"):
+            print(f"  {key:12s} detected: {stats([p for p in det if key in p], key)}")
+            print(f"  {key:12s} hidden  : {stats([p for p in hid if key in p], key)}")
+
     if det and hid:
         separability(mission, det, hid)
     if mission:
@@ -192,7 +211,8 @@ def main(path):
     print(f"  squad scope: team detected in {team_on}/{len(mission)} mission passes, "
           f"mate activity seen in {mate_seen}")
 
-    print("\ntop change hashes (total changes, passes seen, share of change-lines, avg per pass):")
+    print("\ntop change keys (enemy names on current logs, resource hashes on older ones; "
+          "total changes, passes seen, share of change-lines, avg per pass):")
     for key, total in hashes.most_common(20):
         seen = hash_passes[key]
         share = seen / change_lines if change_lines else 0

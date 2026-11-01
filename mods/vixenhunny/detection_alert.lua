@@ -4,14 +4,22 @@
 -- "enemies are on me" from "enemies are on my squad".
 --
 -- Sources, in priority order:
---   1. AggroCounter's per-player counts, when it is running (needs LuaJIT FFI; off on current builds).
---   2. Wwise audio-state heuristic, on builds that still have WwiseFlowCallbacks (gone on current builds).
---   3. Enemy sampler: a read-only walk over the main world's units that counts animation-state changes
+--   1. Enemy sampler: a read-only walk over the main world's units that counts animation-state changes
 --      and units sitting outside their learned calm states. This is the live source on current builds.
+--   2. Wwise audio-state heuristic, on builds that still have WwiseFlowCallbacks (gone on current builds).
+--
+-- What counts as an enemy. The engine hands out resource hashes, not names, so the sampler used to treat
+-- every animated unit as a possible enemy and lean on a learned calm model to tell churn from combat. It
+-- no longer does: the ENEMY table below is an explicit whitelist of enemy resource hashes, taken from the
+-- EnemyData project, and a unit whose hash is not in it is ignored outright. Hellpods, sentries,
+-- exosuits, Guard Dogs, SEAF troopers, civilians, structures and the world's ~17000 props therefore
+-- cannot reach any count, and the counts the mod publishes are real enemy counts rather than an
+-- activity proxy. That is what replaced the AggroCounter dependency, which needed LuaJIT FFI to read
+-- game memory and has been off on every current build.
 --
 -- Attribution. Every Helldiver shares one unit resource hash, so "which of these four is me" cannot be
 -- answered from the resource alone. The sampler keeps every player unit it finds as an ANCHOR, picks one
--- as you (see resolve_me), and attributes each active enemy to the anchor it is nearest:
+-- as you (see resolve_me), and attributes each enemy to the anchor it is nearest:
 --   me    enemy within CFG.me_radius of your anchor          -> drives is_detected and the eye
 --   mate  enemy within CFG.team_radius of a squadmate's      -> drives team_detected, status only
 --   loose enemy near nobody                                   -> ignored, logged for tuning
@@ -31,13 +39,15 @@ local DetectionAlert = {
 	eye_intensity = 0, -- 0 = idle ember glow, 1 = full alert red
 	eye_color = nil, -- set below from CFG.eye.idle
 	enemies_searching = false, -- status-only: alert-tier audio/activity, short of full detection
-	-- search_count/detect_count are REAL enemy counts, taken from AggroCounter (search / me) when it is
-	-- running, and -1 when it is not. The sampler cannot tell searching from detecting per enemy, so it
-	-- supplies activity counts instead: active_units, alerted_units (on you) and team_alerted (on your squad).
+	-- search_count/detect_count are REAL enemy counts, which the hash whitelist makes possible: how many
+	-- enemies the last completed pass found alive in the sampled world, and how many of those were within
+	-- CFG.me_radius of you. Both read -1 until a pass completes, so an overlay can tell "none nearby"
+	-- from "nothing measured yet". Neither says whether those enemies have noticed you -- that is what
+	-- the activity counts below (active_units, alerted_units, team_alerted) are for.
 	search_count = -1,
 	detect_count = -1,
 	active_units = 0,
-	count_source = "none", -- "aggro" or "none"
+	count_source = "none", -- "hashes" once a pass has completed, otherwise "none"
 	alerted_units = 0,
 	team_alerted = 0,
 	team_detected = false,
@@ -73,7 +83,7 @@ local CFG = {
 
 	-- Sampler walk. A full pass covers every unit in the main world, spread over frames.
 	pass_seconds = 5,
-	max_units_per_frame = 400,
+	max_units_per_frame = 4000,
 	detail_interval = 30,
 	top_count = 8,
 	min_animated = 20, -- fewer animated units than this is a loading screen, not a mission
@@ -83,11 +93,14 @@ local CFG = {
 	-- "changed" (animation-state transitions this pass) and "alerted" (units outside their calm states).
 	-- Values come from tools/analysis/analyze_log.py over a 1290-pass session: on mission passes, quiet
 	-- passes sit at changed p90=1 / alerted p90=4, fights at changed p25=6 / alerted p25=11.
+	-- That session predates the ENEMY whitelist, and was measured with every animated unit feeding the
+	-- counts. The whitelist can only remove contributions, never add any, so these thresholds now read
+	-- slightly conservative; retune them against a fresh capture rather than by eye.
 	detect = { enter = 6, pair = 3, exit_at = 1, exit_passes = 2 },
 	alert_detect = { enter = 8, exit_at = 3 },
 	search = { enter = 3, exit_at = 1, exit_passes = 2 },
 
-	-- Alerted-enemy count. Per unit resource the sampler learns which animation states its units sit in
+	-- Alerted-enemy count. Per enemy resource the sampler learns which animation states its units sit in
 	-- during quiet passes; a unit outside that set is "alerted" (noticing, chasing, fighting, hit, dying).
 	alert_count = true,
 	calm_min_samples = 40, -- quiet-pass observations a hash needs before its units are counted at all
@@ -102,14 +115,16 @@ local CFG = {
 	max_anchors = 8, -- player units tracked at once (a squad is 4; the spare room absorbs respawn copies)
 	anchor_grace = 3, -- passes an anchor may go unseen before it is dropped, so one thin pass is survivable
 
-	-- Unit resources. Every Helldiver uses the same one, so these identify "a player", not "you".
+	-- Unit resources. Every Helldiver uses the same one, so these identify "a player", not "you". It is
+	-- the "Player Clone (Avatar)" entry of the same EnemyData table the ENEMY whitelist comes from.
 	me_hashes = { ["4d1c334d294dfa97"] = true },
 	player_hashes = {}, -- extra player-character resources, if a build ever uses more than one
-	-- Resources that change state every pass whether or not anything is happening. Take hashes from the
-	-- "changes" lines: one that shows up as =1 in almost every pass, calm or busy, belongs here.
-	ambient_hashes = {
-		["685337c9ccf0e45c"] = true, -- ship/lobby burst only; without this "searching" turns on in the ship
-	},
+	-- Escape hatch for a WHITELISTED enemy resource that changes animation state every pass whether or
+	-- not anything is happening: its changes are counted as ambient and drive nothing. Take hashes from
+	-- the "changes" lines -- one that shows up as =1 in almost every pass, calm or busy, belongs here.
+	-- Empty since the whitelist landed: the ship/lobby resource that used to need this (685337c9ccf0e45c)
+	-- is not an enemy, so it no longer reaches the counts at all.
+	ambient_hashes = {},
 
 	-- Finding you. There is no local-player API on this build: the F7 probe's dump of build 26088801
 	-- (loader v21) shows no Player table and no Managers table at all, so the only route is a camera —
@@ -140,32 +155,207 @@ local CFG = {
 	probe_tables = { "Player", "Camera", "Viewport", "Window", "World", "Unit", "Network", "Application", "Managers" },
 
 	keys = { marker_start = "f9", marker_end = "f10", probe = "f7", hud_toggle = "f11" },
-	probe_max_units = 40,
+	probe_max_units = 4000,
 
+	-- On-screen panel. Everything it draws is plain ASCII in fixed-width columns: the draw path is
+	-- Gui.text with the engine's monospace debug font, which is the only font this build is known to
+	-- survive, so box-drawing glyphs are not safe to assume and are not used.
 	hud = {
 		enabled = true,
 		x_fraction = 0.0375, -- from the left edge, same column as P2P-Ping's list
 		y_fraction = 0.60, -- from the bottom, above P2P-Ping's list
 		font = "core/performance_hud/debug",
-		font_size = 26,
+		-- Three sizes, so the verdict carries from across the room while the detail stays out of the way.
+		font_size = 26, -- the state line
+		title_size = 15,
+		meter_size = 18,
+		rule_size = 14,
+		count_size = 21,
+		line_gap = 6,
+		show_title = true,
+		show_meter = true, -- "[####......]", the eye's own glow ramp made visible
 		show_alerted = true,
 		show_team = true,
 		show_active = true,
+		show_near = true, -- "NEAR n": known enemies within me_radius of you, whether or not they are active
+		meter_cells = 10,
+		rule_width = 13, -- the width of a count row: 8-wide label + 3-wide value + a 2-wide flag
+		-- When each row turns amber, then red. The activity rows are wired to the detection tiers just
+		-- below the table, so ON YOU and ACTIVE change colour exactly when the tiers they mirror would
+		-- fire, and retuning the tiers retunes them. NEAR has no tier behind it -- a crowd of unaware
+		-- enemies is not a fight -- so its thresholds are a display choice and nothing else depends on
+		-- them. Red on NEAR beside a green HIDDEN is meant to read as "that is a lot of them", not as
+		-- an alarm.
+		counts = {
+			near = { warn = 8, hot = 20 },
+			alerted = nil, -- set from CFG.alert_detect below
+			team = nil,
+			active = nil, -- set from CFG.search / CFG.detect below
+		},
 		max_faults = 5,
 		retry_seconds = 2,
 		look = {
 			detected = { text = "(O) DETECTED", r = 255, g = 112, b = 105 },
 			searching = { text = "(o) SEARCHING", r = 250, g = 207, b = 96 },
 			hidden = { text = "( ) HIDDEN", r = 112, g = 226, b = 145 },
+			title = { r = 118, g = 132, b = 148 },
+			rule = { r = 68, g = 80, b = 94 },
+			-- A row's resting colour, used while its count is below counts.warn.
 			alerted = { r = 255, g = 170, b = 80 },
 			team = { r = 140, g = 190, b = 255 },
+			near = { r = 200, g = 200, b = 210 },
 			info = { r = 238, g = 243, b = 235 },
+			-- The two escalation colours, matching the searching/detected state colours above.
+			warn = { r = 250, g = 207, b = 96 },
+			hot = { r = 255, g = 112, b = 105 },
 			shadow = { r = 12, g = 15, b = 18 },
 		},
 	},
 }
 
+-- Enemy resource hashes: the mod's whole definition of "enemy". A world unit is counted only when its
+-- resource hash is a key here; everything else is ignored, which is why the counts below are real enemy
+-- counts and not an activity proxy over all 17000 units in the world. The names are for the log only.
+--
+-- Generated from the EnemyData project -- its data/game_names.lua (which unit names are enemies) crossed
+-- with its hash -> name table. Regenerate after a patch adds units:
+--   python tools/gen_enemy_hashes.py --enemy-data <path to EnemyData>
+-- Do not hand-edit between the BEGIN/END markers; that tool rewrites the whole block.
+local ENEMY = {
+	-- BEGIN generated enemy hashes
+	-- 114 enemy resources: automatons 59, illuminate 14, terminids 41
+	["53d8919d7b8abd67"] = "Annihilator Tank", -- automatons
+	["31bae74d2f064d8d"] = "Annihilator Tank MK2", -- automatons
+	["63df3d07b7424588"] = "Barrager Tank", -- automatons
+	["a6a68d8af177f3a1"] = "Berserker", -- automatons
+	["54e107dacf6929cb"] = "Berserker MK2", -- automatons
+	["b056f8fc74aba02d"] = "Cannon Trooper", -- automatons
+	["a71aafd82c6ebc92"] = "Commissar", -- automatons
+	["e0353177f1329573"] = "Conflagration Devastator", -- automatons
+	["c626d2bb495a202d"] = "Devastator", -- automatons
+	["fc8dec78be8ab47d"] = "Devastator MK2 Spawn", -- automatons
+	["ae63e525853d7044"] = "Devastator MK3", -- automatons
+	["98152772a72f7838"] = "Dropship", -- automatons
+	["d37e8d120d2836e3"] = "Factory Strider", -- automatons
+	["282eb766c1ffa6a1"] = "Gunship", -- automatons
+	["f8b5a81a86d5d4eb"] = "Heavy Devastator", -- automatons
+	["b92435fbf60f0748"] = "Heavy Devastator MK2", -- automatons
+	["91ebd77931110afc"] = "Heavy Devastator MK3", -- automatons
+	["96ba14c9ebb49ce1"] = "Hulk", -- automatons
+	["137988cea16458f7"] = "Hulk Bruiser", -- automatons
+	["6dab2eadf5d8b692"] = "Hulk Firebomber", -- automatons
+	["1e66ee1f6f7fd00e"] = "Hulk Obliterator", -- automatons
+	["3e0537d606438fea"] = "Hulk Scorcher", -- automatons
+	["1897bdd32105d2dc"] = "Hulk Scorcher MK2", -- automatons
+	["b5dbc0c240c921ad"] = "Incendiary Berserker", -- automatons
+	["1b5b9ac4f96b36e5"] = "Incendiary Commissar", -- automatons
+	["57eed0eac346cd9d"] = "Incendiary Devastator", -- automatons
+	["58b2b86c11369241"] = "Incendiary MG Devastator", -- automatons
+	["089833d2880d9e06"] = "Incendiary MG Raider", -- automatons
+	["e683d2ca5618d74a"] = "Incendiary Raider", -- automatons
+	["c9bcccb0a54a82a4"] = "Incendiary Rocket Devastator", -- automatons
+	["09dfb04b2e578bc3"] = "Incendiary Rocket Trooper", -- automatons
+	["30f2dee2333f227a"] = "Jammer Factory Strider", -- automatons
+	["d5792f6856b06ba4"] = "Jet Brigade Berserker", -- automatons
+	["215ce160a17be4cd"] = "Jet Brigade Commissar", -- automatons
+	["be743b2faa3a6e26"] = "Jet Brigade Devastator", -- automatons
+	["32cdeada234fb8df"] = "Jet Brigade Hulk Bruiser", -- automatons
+	["e44ec9f9b3fe1d2a"] = "Jet Brigade Hulk Scorcher", -- automatons
+	["a4552f97033392f4"] = "Jet Brigade MG Raider", -- automatons
+	["856e9710e45e760f"] = "Jet Brigade Raider", -- automatons
+	["af0f9b3a163787a5"] = "Jet Brigade Trooper", -- automatons
+	["b4ed319b39f5457b"] = "MG Raider", -- automatons
+	["0002ba767df856f3"] = "Marauder", -- automatons
+	["82a87ad8d595b2ba"] = "Pyro Trooper", -- automatons
+	["64ba5f030b114ec1"] = "Raider", -- automatons
+	["9076eeed17fcee35"] = "Reinforced Scout Strider", -- automatons
+	["9647b00cc3a9d36f"] = "Rocket Devastator", -- automatons
+	["f66d0bad8693779a"] = "Rocket Devastator MK2", -- automatons
+	["2a12104f2853ae16"] = "Rocket Raider", -- automatons
+	["30cf04b2ec8c9bd4"] = "Scout Raider", -- automatons
+	["f8131632aa867107"] = "Scout Strider", -- automatons
+	["257d805caa7e10c0"] = "Shotgun Trooper", -- automatons
+	["c6449ffd9ea3779c"] = "Shredder Tank", -- automatons
+	["9f57782f00e6ed20"] = "Trooper", -- automatons
+	["fb9937035d652c43"] = "Trooper", -- automatons
+	["7ece5304f868f6b3"] = "Trooper (No Package)", -- automatons
+	["7b48cacdbacb3881"] = "Trooper MK2", -- automatons
+	["ae57fcdb49f74e98"] = "Trooper MK2 MG", -- automatons
+	["4019623142351cb6"] = "Trooper MK3", -- automatons
+	["ef570293245a17c2"] = "War Strider", -- automatons
+	["e8f19a0aa958e46d"] = "Crescent Overseer", -- illuminate
+	["604a794ec45bb820"] = "Elevated Overseer", -- illuminate
+	["67dc32dca4f02d33"] = "Fleshmob", -- illuminate
+	["965eae5a51acdd4a"] = "Harvester", -- illuminate
+	["d63fcbff0851b7af"] = "Harvester MK2", -- illuminate
+	["f22d027b37bef107"] = "Leviathan", -- illuminate
+	["da40bb347c7447f2"] = "Overseer", -- illuminate
+	["f1610ac48cdc5240"] = "Overseer (No Package)", -- illuminate
+	["08e6ffc2474287bd"] = "Overseer MK2", -- illuminate
+	["19e18b46ec55d94a"] = "Stingray", -- illuminate
+	["44458a2c52b002fb"] = "Voteless Heavy", -- illuminate
+	["78e1497571012c47"] = "Voteless Light", -- illuminate
+	["0adc9f9173ad8e1d"] = "Voteless Medium", -- illuminate
+	["ac60e78435098c9d"] = "Watcher", -- illuminate
+	["f79cd8bb654397df"] = "Alpha Commander", -- terminids
+	["36aa99cce5e60146"] = "Bile Spewer", -- terminids
+	["ccae5264acd591b7"] = "Bile Spewer MK2", -- terminids
+	["72a83e49ced6db3d"] = "Bile Spitter", -- terminids
+	["9e2e17f2ccccafdd"] = "Bile Titan", -- terminids
+	["10081acef6163ef6"] = "Bile Warrior", -- terminids
+	["d522fd4748d443a5"] = "Brood Commander", -- terminids
+	["1a7fcdff98c664b0"] = "Charger", -- terminids
+	["3aff5fd7d5450b99"] = "Charger Behemoth", -- terminids
+	["a05bd1ec67b3ac4c"] = "Charger Behemoth MK2", -- terminids
+	["960b48a421a3faaa"] = "Dragonroach", -- terminids
+	["a1f37bf2a40fbde4"] = "Hive Guard", -- terminids
+	["d465d9c7f77a07cb"] = "Hivelord", -- terminids
+	["d9511e9f6bd62e3f"] = "Hunter", -- terminids
+	["3d0e03e2d574e1ca"] = "Hunter MK2", -- terminids
+	["5ca832447445c0ba"] = "Hunter MK3", -- terminids
+	["dcf8e74212fbee3b"] = "Impaler", -- terminids
+	["6021e22338333d88"] = "Nursing Spewer", -- terminids
+	["cc7022fdd172089b"] = "Nursing Spewer MK2", -- terminids
+	["aab438596f5e8fd9"] = "Pouncer", -- terminids
+	["883401af2a98a5f6"] = "Predator Hunter", -- terminids
+	["d1e990baf22d5a52"] = "Predator Stalker", -- terminids
+	["0ab7b92b131c228c"] = "Rupture Charger", -- terminids
+	["a381a11c07d3eb94"] = "Rupture Spewer", -- terminids
+	["a35207c6f2150806"] = "Rupture Warrior", -- terminids
+	["8ff0a839830a7692"] = "Scavenger", -- terminids
+	["51eea86bf6997e4e"] = "Scavenger MK2", -- terminids
+	["9a8a3aae287b230c"] = "Scavenger MK3", -- terminids
+	["64090088502435dd"] = "Shrieker", -- terminids
+	["ef04cb84d097a497"] = "Spore Burst Bile Titan", -- terminids
+	["1f0a91729c0004e0"] = "Spore Burst Hunter", -- terminids
+	["db964631be1cf501"] = "Spore Burst Scavenger", -- terminids
+	["728421351d440ebc"] = "Spore Burst Warrior", -- terminids
+	["6b202392f4ab605e"] = "Spore Charger", -- terminids
+	["aa28caf964d05500"] = "Spore Spewer", -- terminids
+	["e02e6bd34b606a85"] = "Spore Spewer MK2", -- terminids
+	["f540ca9d9d4a422e"] = "Stalker", -- terminids
+	["eacee39fa017b495"] = "Warrior", -- terminids
+	["be39e313a1e46bb9"] = "Warrior MK2", -- terminids
+	["32541fc4ec7c9cdc"] = "Warrior MK3", -- terminids
+	["b2a6fa1e4284c7e6"] = "Warrior(Spawned)", -- terminids
+	-- END generated enemy hashes
+}
+
+-- How many resources the whitelist holds, reported at startup so a build running a stale or truncated
+-- table is obvious from the first line of the log.
+local ENEMY_COUNT = 0
+for _ in pairs(ENEMY) do
+	ENEMY_COUNT = ENEMY_COUNT + 1
+end
+
 DetectionAlert.eye_color = { r = CFG.eye.idle.r, g = CFG.eye.idle.g, b = CFG.eye.idle.b }
+
+-- The HUD's escalation points for the rows that mirror a detection tier, filled in here because a Lua
+-- table literal cannot refer to itself. ON YOU and ON TEAM follow the alerted tier, ACTIVE follows the
+-- changed tiers, so each row turns amber as its tier approaches and red as the tier fires.
+CFG.hud.counts.alerted = { warn = CFG.alert_detect.exit_at, hot = CFG.alert_detect.enter }
+CFG.hud.counts.team = CFG.hud.counts.alerted
+CFG.hud.counts.active = { warn = CFG.search.enter, hot = CFG.detect.enter }
 
 local elapsed_time = 0
 
@@ -352,7 +542,7 @@ local function set_flag(key, value, label, source)
 	log(string.format("[DetectionAlert] t=%.2f %s via %s", elapsed_time, string.format(label, tostring(value)), source))
 end
 
--- is_detected is "enemies are on ME": the me scope, or Wwise, or AggroCounter. When you cannot be told
+-- is_detected is "enemies are on ME": the me scope, or Wwise. When you cannot be told
 -- apart from your squad the me scope already holds every anchor's activity, so this never goes quiet
 -- just because the identification failed. is_detected reads better as DETECTED/HIDDEN than true/false,
 -- so it is logged by hand rather than through set_flag.
@@ -364,23 +554,6 @@ local function recompute_detection(source)
 	end
 	set_flag("enemies_searching", WW.searching or SC.me.searching, "enemies_searching=%s", source)
 	set_flag("team_detected", SC.mate.detected, "team_detected=%s", source)
-end
-
-local function aggro_counts()
-	local ac = rawget(_G, "AggroCounter")
-	if type(ac) ~= "table" or type(ac.counts) ~= "table" then
-		return nil
-	end
-	return ac.counts
-end
-
-local function aggro_summary()
-	local counts = aggro_counts()
-	if not counts then
-		return "n/a"
-	end
-	return string.format("near=%s/search=%s/me=%s/team=%s",
-		tostring(counts.near), tostring(counts.search), tostring(counts.me), tostring(counts.team))
 end
 
 -- Advances eye_intensity/eye_color toward the current detection state.
@@ -437,18 +610,20 @@ local S = {
 
 local function reset_pass()
 	S.pass = {
-		units = 0, animated = 0, changed = 0, ambient = 0,
+		units = 0, animated = 0, enemies = 0, changed = 0, ambient = 0,
+		near_me = 0, near_mate = 0,
 		me_changed = 0, me_alerted = 0, mate_changed = 0, mate_alerted = 0,
 		loose = 0, unplaced = 0, unanchored = 0,
-		change_keys = {}, -- changed units by resource hash, for the changes line
-		transitions = {}, -- the same as "hash:from>to", to work out what the state numbers mean
+		change_keys = {}, -- changed enemies by name, for the changes line
+		transitions = {}, -- the same as "name:from>to", to work out what the state numbers mean
 		hash_states = {}, -- hash -> { [state] = units }, the calm model's input
 	}
 end
 reset_pass()
 
--- Counts since the last detail line.
-local DT = { units = 0, animated = 0, changed = 0, states = {}, resources = {} }
+-- Counts since the last detail line. `unknown` holds animated resources that are in neither ENEMY nor
+-- CFG.me_hashes: after a patch adds a unit type, its hash shows up there and belongs in ENEMY.
+local DT = { units = 0, animated = 0, changed = 0, states = {}, resources = {}, unknown = {} }
 
 local function is_player_hash(hash)
 	return CFG.me_hashes[hash] == true or CFG.player_hashes[hash] == true
@@ -530,9 +705,14 @@ local function resource_key(value, mode)
 	return type(value)
 end
 
--- Resource ids are shortened to their 16-digit hash, so changed units can be matched to hash lists.
+-- Resource ids are shortened to their 16-digit hash, so units can be matched against ENEMY. The hash is
+-- lower-cased because ENEMY's keys are, and the engine's text form has been seen either way.
 local function short_resource_key(key)
-	return key:match("%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x") or (key:gsub("%s", "_"))
+	local hash = key:match("%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x")
+	if hash ~= nil then
+		return hash:lower()
+	end
+	return (key:gsub("%s", "_"))
 end
 
 local function unit_hash(resource)
@@ -540,6 +720,16 @@ local function unit_hash(resource)
 		return "unkeyed"
 	end
 	return short_resource_key(resource_key(resource, S.resource_mode))
+end
+
+-- A changed enemy's log key: its name with spaces squeezed out, so the space-separated "changes" and
+-- "transitions" lines stay parseable while being readable (Heavy_Devastator=4, not a bare hash).
+local function enemy_label(hash)
+	local name = ENEMY[hash]
+	if name == nil then
+		return hash
+	end
+	return (name:gsub("%s", "_"))
 end
 
 -- Distance between two positions, or nil when either is missing or the engine returns nonsense.
@@ -760,7 +950,7 @@ local function resolve_me()
 	S.me, S.me_basis, S.me_confirmed = anchors[1], "assumed", false
 end
 
--- Attributes one unit to a scope by distance. Returns "me", "mate", "loose" or "unplaced".
+-- Attributes one enemy to a scope by distance. Returns "me", "mate", "loose" or "unplaced".
 --
 -- An enemy within me_radius of you is yours even when a squadmate is standing closer, because the
 -- question the eye answers is "is anything near ME", not "whose kill is this". Everything else falls to
@@ -768,9 +958,10 @@ end
 -- position could not be read, so it is left out rather than guessed at).
 local function attribute(unit)
 	local anchors = S.anchors
-	-- No player unit found at all: nothing can be placed, so everything counts as yours. That is what
+	-- No player unit found at all: nothing can be placed, so every enemy counts as yours. That is what
 	-- the mod did before the split existed, and it keeps the eye working through the stretches where no
-	-- anchor is in the sampled snapshot instead of going dark for them.
+	-- anchor is in the sampled snapshot instead of going dark for them. `unanchored` counts the enemies
+	-- this happened to, so the log says how much of a pass was attributed blind.
 	if #anchors == 0 then
 		S.pass.unanchored = S.pass.unanchored + 1
 		return "me"
@@ -898,36 +1089,35 @@ local function update_anchors()
 	end
 end
 
--- Scores a completed pass's calm model: when the pass was quiet, every animated unit's state counts as
--- normal behaviour for its resource. Hashes without enough quiet observations are never counted alerted.
+-- Scores a completed pass's calm model: when the pass was quiet, every enemy's state counts as normal
+-- behaviour for its resource. Only whitelisted enemies ever reach hash_states, so the model is now one
+-- entry per enemy type. A hash without enough quiet observations is never counted alerted.
 local function learn_calm(quiet)
 	if not CFG.alert_count or not quiet then
 		return
 	end
 	for hash, states in pairs(S.pass.hash_states) do
-		if hash ~= "unkeyed" then
-			local model = S.calm[hash]
-			if model == nil then
-				model = { total = 0, states = {} }
-				S.calm[hash] = model
+		local model = S.calm[hash]
+		if model == nil then
+			model = { total = 0, states = {} }
+			S.calm[hash] = model
+		end
+		for state, units in pairs(states) do
+			model.states[state] = (model.states[state] or 0) + units
+			model.total = model.total + units
+		end
+		if model.total > CFG.calm_max_total then
+			for state, seen in pairs(model.states) do
+				model.states[state] = seen / 2
 			end
-			for state, units in pairs(states) do
-				model.states[state] = (model.states[state] or 0) + units
-				model.total = model.total + units
-			end
-			if model.total > CFG.calm_max_total then
-				for state, seen in pairs(model.states) do
-					model.states[state] = seen / 2
-				end
-				model.total = model.total / 2
-			end
+			model.total = model.total / 2
 		end
 	end
 end
 
--- True when this unit's animation state is one its resource is not normally seen in.
+-- True when this enemy's animation state is one its resource is not normally seen in.
 local function is_alerted(hash, state)
-	if not CFG.alert_count or hash == "unkeyed" or CFG.ambient_hashes[hash] then
+	if not CFG.alert_count or CFG.ambient_hashes[hash] then
 		return false
 	end
 	local model = S.calm[hash]
@@ -938,7 +1128,8 @@ local function is_alerted(hash, state)
 	return seen == nil or seen / model.total < CFG.calm_min_share
 end
 
--- One line for the detail log: the biggest hashes and their calm states, so the model can be checked by eye.
+-- One line for the detail log: the biggest enemy types and their calm states, so the model can be
+-- checked by eye.
 local function calm_model_summary()
 	local list = {}
 	for hash, model in pairs(S.calm) do
@@ -958,7 +1149,7 @@ local function calm_model_summary()
 			end
 		end
 		table.sort(calm, function(a, b) return (tonumber(a) or 0) < (tonumber(b) or 0) end)
-		parts[#parts + 1] = string.format("%s(n=%d):%s", entry.hash, math.floor(entry.model.total),
+		parts[#parts + 1] = string.format("%s(n=%d):%s", enemy_label(entry.hash), math.floor(entry.model.total),
 			table.concat(calm, ",", 1, math.min(#calm, 12)))
 	end
 	return #parts > 0 and table.concat(parts, " ") or "none"
@@ -996,8 +1187,8 @@ local function log_pass(total)
 		log_error("update_anchors", anchor_err)
 	end
 
-	log(string.format("[DetectionAlert] pass t=%.1f wall=%s units=%d animated=%d changed=%d ambient=%d me=%d mate=%d loose=%d unplaced=%d unanchored=%d alerted_me=%d alerted_mate=%d detected=%d searching=%d team=%d cost=%.1fms",
-		elapsed_time, wall_clock(), p.units, p.animated, p.changed, p.ambient,
+	log(string.format("[DetectionAlert] pass t=%.1f wall=%s units=%d animated=%d enemies=%d near_me=%d near_mate=%d changed=%d ambient=%d me=%d mate=%d loose=%d unplaced=%d unanchored=%d alerted_me=%d alerted_mate=%d detected=%d searching=%d team=%d cost=%.1fms",
+		elapsed_time, wall_clock(), p.units, p.animated, p.enemies, p.near_me, p.near_mate, p.changed, p.ambient,
 		me_changed, mate_changed, p.loose, p.unplaced, p.unanchored, me_alerted, mate_alerted,
 		DetectionAlert.is_detected and 1 or 0, DetectionAlert.enemies_searching and 1 or 0,
 		DetectionAlert.team_detected and 1 or 0, S.cost * 1000))
@@ -1013,13 +1204,16 @@ local function log_pass(total)
 		log(string.format("[DetectionAlert] transitions t=%.1f %s", elapsed_time, top_counts(p.transitions, 16)))
 	end
 
-	S.last_pass = { total = total, units = p.units, animated = p.animated, changed = p.changed }
+	S.last_pass = { total = total, units = p.units, animated = p.animated, changed = p.changed,
+		enemies = p.enemies, near_me = p.near_me, near_mate = p.near_mate }
 	S.cost = 0
 	reset_pass()
 end
 
--- Samples one unit: counts it into the pass and detail totals, records animation-state changes, and
--- attributes anything that changed or looks alerted to you, a squadmate or nobody.
+-- Samples one unit: counts it into the pass and detail totals, and -- for a unit whose resource is in
+-- ENEMY -- records its animation-state change and attributes it to you, a squadmate or nobody. A unit
+-- that is neither a player nor a known enemy is counted in the totals and then dropped: it can reach no
+-- scope, no calm model and no published count.
 local function sample_unit(unit)
 	if engine_call("Unit", "alive", unit) ~= true then
 		return
@@ -1042,6 +1236,8 @@ local function sample_unit(unit)
 		log("[DetectionAlert]   debug_name sample: " .. describe_state(engine_call("Unit", "debug_name", unit)))
 	end
 
+	-- animated is still every animated unit, player and prop included: it is the loading-screen gate
+	-- (CFG.min_animated), not an enemy count.
 	if engine_call("Unit", "has_animation_state_machine", unit) ~= true then
 		return
 	end
@@ -1059,6 +1255,14 @@ local function sample_unit(unit)
 		S.last_state[unit] = state
 		return
 	end
+
+	-- The whitelist. Anything not named in ENEMY stops here; its hash is logged in the detail block so a
+	-- unit type a patch added can be spotted and added to the table.
+	if ENEMY[hash] == nil then
+		count_into(DT.unknown, hash)
+		return
+	end
+	p.enemies = p.enemies + 1
 
 	if CFG.alert_count then
 		local per_hash = p.hash_states[hash]
@@ -1078,8 +1282,9 @@ local function sample_unit(unit)
 		p.changed = p.changed + 1
 		DT.changed = DT.changed + 1
 		S.changes_total = S.changes_total + 1
-		count_into(p.change_keys, hash)
-		count_into(p.transitions, hash .. ":" .. previous .. ">" .. state)
+		local label = enemy_label(hash)
+		count_into(p.change_keys, label)
+		count_into(p.transitions, label .. ":" .. previous .. ">" .. state)
 	end
 	if CFG.ambient_hashes[hash] then
 		if changed then
@@ -1087,16 +1292,17 @@ local function sample_unit(unit)
 		end
 		return
 	end
-	if not changed and not alerted then
-		return
-	end
 
-	-- One position lookup per interesting unit, shared by both tallies.
+	-- One position lookup per enemy. Every enemy is placed, not just the active ones, because near_me
+	-- and near_mate are counts of enemies around you rather than of activity: that is what the whitelist
+	-- bought, and it is cheap because the pass reaches at most a few dozen enemies among 17000 units.
 	local bucket = attribute(unit)
 	if bucket == "me" then
+		p.near_me = p.near_me + 1
 		if changed then p.me_changed = p.me_changed + 1 end
 		if alerted then p.me_alerted = p.me_alerted + 1 end
 	elseif bucket == "mate" then
+		p.near_mate = p.near_mate + 1
 		if changed then p.mate_changed = p.mate_changed + 1 end
 		if alerted then p.mate_alerted = p.mate_alerted + 1 end
 	elseif bucket == "loose" then
@@ -1145,6 +1351,9 @@ local function sample_enemies(dt)
 			elapsed_time, wall_clock(), total, DT.units, DT.animated, DT.changed, S.changes_total))
 		log("[DetectionAlert]   states: " .. top_counts(DT.states))
 		log("[DetectionAlert]   resources: " .. top_counts(DT.resources))
+		-- Animated units that are neither a player nor in ENEMY. Mostly props, sentries and hellpods, but
+		-- a hash climbing this list after a game patch is a new enemy type missing from the whitelist.
+		log("[DetectionAlert]   unlisted animated: " .. top_counts(DT.unknown))
 		log("[DetectionAlert]   calm model: " .. calm_model_summary())
 		local spread = anchor_spread()
 		log(string.format("[DetectionAlert]   team: mode=%s basis=%s anchors=%d spread=%s me_radius=%d team_radius=%d alerted_mate=%d",
@@ -1152,7 +1361,7 @@ local function sample_enemies(dt)
 			spread and string.format("%.0fm", spread) or "?",
 			CFG.me_radius, CFG.team_radius, SC.mate.alerted))
 		DT.units, DT.animated, DT.changed = 0, 0, 0
-		DT.states, DT.resources = {}, {}
+		DT.states, DT.resources, DT.unknown = {}, {}, {}
 	end
 end
 
@@ -1187,7 +1396,8 @@ local function sample_summary()
 	if not s then
 		return "n/a"
 	end
-	return string.format("total=%d/units=%d/animated=%d/changed=%d", s.total, s.units, s.animated, s.changed)
+	return string.format("total=%d/units=%d/animated=%d/enemies=%d/near_me=%d/changed=%d",
+		s.total, s.units, s.animated, s.enemies, s.near_me, s.changed)
 end
 
 -- Probe: a read-only inventory of what this runtime exposes. It records names and types and only reads
@@ -1244,13 +1454,7 @@ local function run_probe()
 		log("[DetectionAlert]   CowboyBingusModLoader=" .. type(loader))
 	end
 
-	local ac = rawget(_G, "AggroCounter")
-	if type(ac) == "table" then
-		log(string.format("[DetectionAlert]   AggroCounter: api=%s version=%s status=%s counts=%s",
-			tostring(ac.api), tostring(ac.version), tostring(ac.status), aggro_summary()))
-	else
-		log("[DetectionAlert]   AggroCounter=" .. type(ac))
-	end
+	log(string.format("[DetectionAlert]   enemy whitelist: %d resource hashes", ENEMY_COUNT))
 
 	local engine = rawget(_G, "stingray")
 	if type(engine) ~= "table" then
@@ -1342,12 +1546,14 @@ local function team_probe_run()
 			local hash = unit_hash(engine_call("Unit", "resource_name", unit))
 			if is_player_hash(hash) then
 				mine[#mine + 1] = { unit = unit, hash = hash }
-			elseif #others < CFG.probe_max_units then
+			elseif ENEMY[hash] ~= nil and #others < CFG.probe_max_units then
+				-- Only whitelisted enemies are measured; before the whitelist this listed every animated
+				-- prop in the level, which drowned the useful lines.
 				others[#others + 1] = { unit = unit, hash = hash }
 			end
 		end
 	end
-	log(string.format("[DetectionAlert] team probe: %d animated player unit(s), %d other animated units to measure, tracked anchors=%d mode=%s basis=%s",
+	log(string.format("[DetectionAlert] team probe: %d animated player unit(s), %d enemy unit(s) to measure, tracked anchors=%d mode=%s basis=%s",
 		#mine, #others, #S.anchors, S.mode, S.me_basis))
 	if #mine == 0 then
 		log("[DetectionAlert] team probe: no player unit found, so CFG.me_hashes is wrong for this build")
@@ -1392,7 +1598,8 @@ local function team_probe_run()
 	for index, entry in ipairs(others) do
 		local pos = engine_call("Unit", "world_position", entry.unit, 0)
 		local d2 = distance_squared(origin, pos)
-		log(string.format("[DetectionAlert] team probe: unit %d resource %s is %s m from player unit 1", index, entry.hash,
+		log(string.format("[DetectionAlert] team probe: enemy %d %s (%s) is %s m from player unit 1", index,
+			ENEMY[entry.hash] or "?", entry.hash,
 			d2 and string.format("%.1f", math.sqrt(d2)) or "?"))
 	end
 	log("[DetectionAlert] team probe: finished, no crash")
@@ -1505,23 +1712,81 @@ local function hud_get_gui(game_world)
 	return made
 end
 
+-- One count row: "ON TEAM      3 !", padded into the fixed-width columns the rule line is measured
+-- against. A row rests in its own colour and escalates to amber then red with its count, so a glance
+-- at the colours says as much as reading the numbers.
+--
+-- `key` is both the colour-cache key and the redraw key, so the tier is baked into it: a row that
+-- changes colour without changing key would keep the stale cached colour AND be judged unchanged.
+local function hud_count_row(key, label, value, flag, resting)
+	local tiers, look = CFG.hud.counts[key], CFG.hud.look
+	local tier, shown = "calm", resting
+	if tiers ~= nil and type(value) == "number" then
+		if value >= tiers.hot then
+			tier, shown = "hot", look.hot
+		elseif value >= tiers.warn then
+			tier, shown = "warn", look.warn
+		end
+	end
+	-- A flag is only ever set when that row's tier has fired, so it carries colour too: "ON TEAM 0 !"
+	-- in resting blue would say the squad is clear in the same breath as saying it is not.
+	if flag ~= nil and tier == "calm" then
+		tier, shown = "warn", look.warn
+	end
+	return {
+		text = string.format("%-8s%3s%s", label, tostring(value), flag or ""),
+		key = key .. ":" .. tier,
+		look = shown,
+		size = CFG.hud.count_size,
+	}
+end
+
 local function hud_lines()
-	local look = CFG.hud.look
+	local hud, look = CFG.hud, CFG.hud.look
 	local state = DetectionAlert.is_detected and "detected"
 		or (DetectionAlert.enemies_searching and "searching" or "hidden")
-	local lines = { { text = look[state].text, key = state, look = look[state] } }
-	if CFG.hud.show_alerted then
-		lines[#lines + 1] = { text = "ON YOU " .. tostring(SC.me.alerted), key = "alerted", look = look.alerted }
+	local state_look = look[state]
+	local lines = {}
+	if hud.show_title then
+		lines[#lines + 1] = { text = "DETECTION ALERT", key = "title", look = look.title, size = hud.title_size }
 	end
-	if CFG.hud.show_team and CFG.team_split then
+	lines[#lines + 1] = { text = state_look.text, key = state, look = state_look, size = hud.font_size }
+	if hud.show_meter then
+		-- The eye's own glow ramp, which until now only ever reached the status file. Quantised to the
+		-- cells it can actually show, so a fade redraws meter_cells times instead of once a frame.
+		local cells = math.floor(DetectionAlert.eye_intensity * hud.meter_cells + 0.5)
+		cells = math.max(0, math.min(hud.meter_cells, cells))
+		lines[#lines + 1] = {
+			text = "[" .. string.rep("#", cells) .. string.rep(".", hud.meter_cells - cells) .. "]",
+			key = "meter:" .. state, look = state_look, size = hud.meter_size,
+		}
+	end
+
+	local counts = {}
+	if hud.show_near then
+		-- A real count, not an activity figure: known enemy resources standing within me_radius of you,
+		-- whether or not any of them has noticed you. "-" until the first pass finishes.
+		local last = S.last_pass
+		counts[#counts + 1] = hud_count_row("near", "NEAR", last and last.near_me or "-", nil, look.near)
+	end
+	if hud.show_alerted then
+		counts[#counts + 1] = hud_count_row("alerted", "ON YOU", SC.me.alerted, nil, look.alerted)
+	end
+	if hud.show_team and CFG.team_split then
 		-- "?" while nobody can be told apart from you: a number there would be a guess.
-		local shown = S.mode == "me"
-			and (tostring(SC.mate.alerted) .. (DetectionAlert.team_detected and "!" or ""))
-			or "?"
-		lines[#lines + 1] = { text = "ON TEAM " .. shown, key = "team", look = look.team }
+		local known = S.mode == "me"
+		counts[#counts + 1] = hud_count_row("team", "ON TEAM", known and SC.mate.alerted or "?",
+			(known and DetectionAlert.team_detected) and " !" or nil, look.team)
 	end
-	if CFG.hud.show_active then
-		lines[#lines + 1] = { text = "ACTIVE " .. tostring(SC.me.changed), key = "info", look = look.info }
+	if hud.show_active then
+		counts[#counts + 1] = hud_count_row("active", "ACTIVE", SC.me.changed, nil, look.info)
+	end
+	if #counts > 0 then
+		lines[#lines + 1] = { text = string.rep("-", hud.rule_width), key = "rule",
+			look = look.rule, size = hud.rule_size }
+		for _, row in ipairs(counts) do
+			lines[#lines + 1] = row
+		end
 	end
 	return lines
 end
@@ -1558,17 +1823,24 @@ local function hud_draw()
 	end
 	hud_log_once("resolution", string.format("resolution=%dx%d", width, height))
 
-	local size = CFG.hud.font_size
 	local x = math.floor(math.max(24, width * CFG.hud.x_fraction) + 0.5)
-	local y = math.floor(height * CFG.hud.y_fraction + 0.5)
+	local py = math.floor(height * CFG.hud.y_fraction + 0.5)
 	local destroy = engine_fn("Gui", "destroy_text")
 	local lines = hud_lines()
+	-- Rows are different sizes, so each steps down by the PREVIOUS row's height rather than by a fixed
+	-- stride, and `size` joins the cache key: a row that changed only its size would otherwise be
+	-- judged unchanged and keep the old glyphs.
+	local previous_size = nil
 	for index, line in ipairs(lines) do
-		local py = y - (index - 1) * (size + 6)
+		local size = line.size or CFG.hud.font_size
+		if previous_size ~= nil then
+			py = py - (previous_size + CFG.hud.line_gap)
+		end
+		previous_size = size
 		local cached = HUD.cache[index]
 		local pair = HUD.ids[index] or {}
-		if cached == nil or cached.text ~= line.text or cached.key ~= line.key or cached.x ~= x or cached.y ~= py
-			or pair.shadow == nil or pair.main == nil then
+		if cached == nil or cached.text ~= line.text or cached.key ~= line.key or cached.x ~= x
+			or cached.y ~= py or cached.size ~= size or pair.shadow == nil or pair.main == nil then
 			hud_destroy_pair(target_gui, pair, destroy)
 			local ok_shadow, shadow_pos = pcall(Vector2, x + 1, py - 1)
 			local ok_main, main_pos = pcall(Vector2, x, py)
@@ -1593,7 +1865,7 @@ local function hud_draw()
 				end
 			end
 			HUD.ids[index] = pair
-			HUD.cache[index] = { text = line.text, key = line.key, x = x, y = py }
+			HUD.cache[index] = { text = line.text, key = line.key, x = x, y = py, size = size }
 		end
 	end
 	for index in pairs(HUD.ids) do
@@ -1769,14 +2041,15 @@ local function open_status_file()
 	end
 end
 
--- Fills the public counts. AggroCounter's own numbers are used only when it is live; otherwise -1 says
--- "not available" (not zero, so an overlay does not show "0 enemies searching" while nothing is counted).
+-- Fills the public counts from the last completed pass. Until one completes -- and whenever a mission
+-- ends, which clears S.last_pass -- the two enemy counts read -1 rather than 0, so an overlay can tell
+-- "no enemies around" from "nothing measured yet".
 local function refresh_counts()
-	local counts = aggro_counts()
-	if counts and type(counts.search) == "number" and type(counts.me) == "number" then
-		DetectionAlert.search_count = math.floor(counts.search)
-		DetectionAlert.detect_count = math.floor(counts.me)
-		DetectionAlert.count_source = "aggro"
+	local last = S.last_pass
+	if last then
+		DetectionAlert.search_count = last.enemies
+		DetectionAlert.detect_count = last.near_me
+		DetectionAlert.count_source = "hashes"
 	else
 		DetectionAlert.search_count = -1
 		DetectionAlert.detect_count = -1
@@ -1826,10 +2099,10 @@ local TIMERS = { wwise_sync = 0, heartbeat = CFG.heartbeat_interval }
 
 local function heartbeat()
 	log(string.format(
-		"[DetectionAlert] t=%.1f heartbeat detected=%s searching=%s team=%s wwise_calls=%d wwise_signal_calls=%d wwise_matches=%d errors=%d aggro=%s sample=%s me=%d/%d mate=%d/%d anchors=%d mode=%s status_bytes=%d",
+		"[DetectionAlert] t=%.1f heartbeat detected=%s searching=%s team=%s wwise_calls=%d wwise_signal_calls=%d wwise_matches=%d errors=%d sample=%s me=%d/%d mate=%d/%d anchors=%d mode=%s status_bytes=%d",
 		elapsed_time, tostring(DetectionAlert.is_detected), tostring(DetectionAlert.enemies_searching),
 		tostring(DetectionAlert.team_detected), WW.calls, WW.signal_calls, WW.matches, LOG.errors,
-		aggro_summary(), sample_summary(), SC.me.changed, SC.me.alerted, SC.mate.changed, SC.mate.alerted,
+		sample_summary(), SC.me.changed, SC.me.alerted, SC.mate.changed, SC.mate.alerted,
 		#S.anchors, S.mode, ST.bytes))
 end
 
@@ -1935,6 +2208,8 @@ local function report_environment()
 		type(rawget(_G, "update")), type(rawget(_G, "io")),
 		(type(os) == "table" and type(os.getenv)) or "n/a"))
 	log("[DetectionAlert] log file: " .. tostring(LOG.target))
+	log(string.format("[DetectionAlert] enemies: %d whitelisted resource hashes; units outside the list are never counted",
+		ENEMY_COUNT))
 	log(string.format("[DetectionAlert] tiers: detect_enter=%d/%d exit<=%d x%d alerted_enter=%d exit<=%d search_enter=%d exit<=%d x%d min_animated=%d",
 		CFG.detect.enter, CFG.detect.pair, CFG.detect.exit_at, CFG.detect.exit_passes,
 		CFG.alert_detect.enter, CFG.alert_detect.exit_at,
