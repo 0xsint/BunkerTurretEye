@@ -26,8 +26,9 @@
 -- When you cannot be identified, every anchor counts as you and basis= says so, so the eye keeps working
 -- exactly as it did before rather than going dark.
 --
--- Runs under Chef Shared Loader (1.5.0+). Chef gives this file its own environment and a `chef` table of
--- helpers (its own log, the keys, the once-a-frame update() call), so nothing here reaches for another mod.
+-- Runs under Chef Shared Loader (1.5.0+). Chef gives this file its own environment and passes it a `chef`
+-- table of helpers (its own log, the keys) as the chunk's argument -- an HD2-Addon gets no `chef` global;
+-- only HD2-Boot scripts do. Chef calls the update() this file sets once a frame.
 --
 -- Targets plain Lua 5.1.4 (current builds have no LuaJIT): no 5.2+ syntax or library calls, and the main
 -- chunk must stay under 200 locals, which is why the constants and state below live in grouped tables.
@@ -36,6 +37,16 @@
 -- Diagnostics: DetectionAlert.log (in %APPDATA%\Arrowhead\Helldivers2, the folder Chef keeps mod logs in)
 -- records the startup checks, every state change, errors, one line per sampler pass, and a heartbeat.
 -- CFG.debug adds the capability probe, the detail block and the per-callback Wwise dumps.
+
+-- Chef hands an addon its helpers as the chunk's argument. The global is the HD2-Boot route, kept as a
+-- fallback so the file still starts if it is ever shipped that way.
+local chef = ...
+if type(chef) ~= "table" then
+	chef = rawget(_G, "chef")
+end
+if type(chef) ~= "table" then
+	error("Detection Alert needs Chef Shared Loader 1.5.0+: no chef helper table was passed to it", 0)
+end
 
 local DetectionAlert = {
 	is_detected = false,
@@ -74,10 +85,17 @@ local CFG = {
 		ramp_down = 1.0, -- fades out slower
 	},
 
+	-- Logging switch: the default for the "Logging" row in Chef's options menu (F9), which overrides it from
+	-- then on. Off means nothing is logged at all: no chef.log line, own_log is never called (so no
+	-- DetectionAlert.log is created), and DetectionAlertStatus.log stops being written, so the desktop overlay
+	-- shows WAITING. Only the probe file is still written, and only when F7 tries a getter: it is the record
+	-- that stops a call which crashed the game from ever being tried again.
+	logging = true,
+
 	-- Diagnostic logging, off by default. When false, the startup probes, the detail block (apart from its
 	-- unlisted animated line), the per-callback Wwise dumps, state transitions and successful key ids are not
 	-- written at all. The pass, attribution, changes, marker, error and heartbeat lines always are: analyze_log.py
-	-- parses them.
+	-- parses them. Has no effect while logging is off.
 	debug = false,
 
 	log_name = "DetectionAlert", -- chef.own_log adds the .log
@@ -168,10 +186,13 @@ local CFG = {
 	-- On-screen panel. Everything it draws is plain ASCII in fixed-width columns: the draw path is
 	-- Gui.text with the engine's monospace debug font, which is the only font this build is known to
 	-- survive, so box-drawing glyphs are not safe to assume and are not used.
+	-- enabled is the code-level kill switch. The position, size and show_* fields are only defaults: each
+	-- has a row in Chef's options menu (F9, see "Options menu" below), and the player's choice wins.
 	hud = {
 		enabled = true,
 		x_fraction = 0.0375, -- from the left edge, same column as P2P-Ping's list
 		y_fraction = 0.60, -- from the bottom, above P2P-Ping's list
+		scale = 1.0, -- multiplies every size and the gap between rows
 		font = "core/performance_hud/debug",
 		-- Three sizes, so the verdict carries from across the room while the detail stays out of the way.
 		font_size = 26, -- the state line
@@ -181,6 +202,7 @@ local CFG = {
 		count_size = 21,
 		line_gap = 6,
 		show_title = true,
+		show_state = true, -- "(O) DETECTED" / "(o) SEARCHING" / "( ) HIDDEN"
 		show_meter = true, -- "[####......]", the eye's own glow ramp made visible
 		show_alerted = true,
 		show_team = true,
@@ -369,7 +391,9 @@ local elapsed_time = 0
 
 -- Logging: chef.own_log gives the mod its own file in Chef's folder, and chef.log writes to it from then on.
 -- If that file cannot be opened, chef.log still takes the lines, into the loader's shared log instead.
-local LOG = { opened = false, target = "not opened yet", errors = 0 }
+-- LOG.on is the menu switch: while it is false, log() returns before anything reaches Chef, and write_status
+-- writes nothing.
+local LOG = { on = CFG.logging, opened = false, target = "not opened yet", errors = 0 }
 
 local function write_line(handle, text)
 	handle:write(text, "\n")
@@ -377,6 +401,9 @@ local function write_line(handle, text)
 end
 
 local function log(text)
+	if not LOG.on then
+		return
+	end
 	if not LOG.opened then
 		LOG.opened = true
 		local ok, opened, err = pcall(chef.own_log, CFG.log_name)
@@ -384,6 +411,22 @@ local function log(text)
 			or ("chef_loader.log (own_log: " .. tostring(err or opened) .. ")")
 	end
 	pcall(chef.log, "%s", text)
+end
+
+-- The menu row. Its saved value wins over CFG.logging, and a change applies at once: turned on mid-session,
+-- the log opens with a line saying so; turned off, nothing more is written, not even a line saying that.
+do
+	-- The menu groups this mod's rows under its title; set before the first row so it never shows the file name.
+	pcall(chef.title, "Detection Alert")
+	local ok, value = pcall(chef.option, "logging", { type = "toggle", label = "Logging", default = CFG.logging,
+		heading = "Logging" })
+	if ok and type(value) == "boolean" then
+		LOG.on = value
+	end
+	pcall(chef.on_change, "logging", function(on)
+		LOG.on = on == true
+		log(string.format("[DetectionAlert] t=%.1f logging turned on from the options menu", elapsed_time))
+	end)
 end
 
 local function log_error(where, err)
@@ -742,27 +785,6 @@ local function probe_state_path()
 	return chef.log_directory .. "\\" .. CFG.probe_state_file
 end
 
--- The probe file used to live in %LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs. A record found only there is
--- copied into Chef's folder once, so a getter already recorded as fatal is still never tried.
-local function carry_probe_state()
-	if chef.previous_directory == nil then
-		return
-	end
-	local ok, old = pcall(io.open, chef.previous_directory .. "\\CowboyBingus\\Helldivers2\\Logs\\" .. CFG.probe_state_file, "r")
-	if not ok or not old then
-		return
-	end
-	local body = old:read("*a")
-	old:close()
-	if type(body) == "string" and body ~= "" then
-		local opened, out = pcall(io.open, PROBE.path, "w")
-		if opened and out then
-			out:write(body)
-			out:close()
-		end
-	end
-end
-
 local function load_probe_state()
 	if PROBE.loaded then
 		return
@@ -773,11 +795,6 @@ local function load_probe_state()
 	if PROBE.path ~= nil and type(io) == "table" and type(io.open) == "function" then
 		local ok, opened = pcall(io.open, PROBE.path, "r")
 		handle = ok and opened or nil
-		if handle == nil then
-			carry_probe_state()
-			ok, opened = pcall(io.open, PROBE.path, "r")
-			handle = ok and opened or nil
-		end
 	end
 	if handle ~= nil then
 		pcall(function()
@@ -1754,7 +1771,9 @@ local function hud_lines()
 	if hud.show_title then
 		lines[#lines + 1] = { text = "DETECTION ALERT", key = "title", look = look.title, size = hud.title_size }
 	end
-	lines[#lines + 1] = { text = state_look.text, key = state, look = state_look, size = hud.font_size }
+	if hud.show_state then
+		lines[#lines + 1] = { text = state_look.text, key = state, look = state_look, size = hud.font_size }
+	end
 	if hud.show_meter then
 		-- The eye's own glow ramp, which until now only ever reached the status file. Quantised to the
 		-- cells it can actually show, so a fade redraws meter_cells times instead of once a frame.
@@ -1829,16 +1848,19 @@ local function hud_draw()
 
 	local x = math.floor(math.max(24, width * CFG.hud.x_fraction) + 0.5)
 	local py = math.floor(height * CFG.hud.y_fraction + 0.5)
+	local scale = CFG.hud.scale
+	local gap = math.floor(CFG.hud.line_gap * scale + 0.5)
 	local destroy = engine_fn("Gui", "destroy_text")
 	local lines = hud_lines()
 	-- Rows are different sizes, so each steps down by the PREVIOUS row's height rather than by a fixed
 	-- stride, and `size` joins the cache key: a row that changed only its size would otherwise be
-	-- judged unchanged and keep the old glyphs.
+	-- judged unchanged and keep the old glyphs. That is also what redraws the panel when the menu moves
+	-- or resizes it: x, y and size all change.
 	local previous_size = nil
 	for index, line in ipairs(lines) do
-		local size = line.size or CFG.hud.font_size
+		local size = math.max(1, math.floor((line.size or CFG.hud.font_size) * scale + 0.5))
 		if previous_size ~= nil then
-			py = py - (previous_size + CFG.hud.line_gap)
+			py = py - (previous_size + gap)
 		end
 		previous_size = size
 		local cached = HUD.cache[index]
@@ -1880,9 +1902,15 @@ local function hud_draw()
 	end
 end
 
-local function hud_toggle()
-	HUD.visible = not HUD.visible
-	if not HUD.visible and HUD.gui ~= nil and S.session_active then
+-- Shows or hides the panel. Both the "Show HUD" menu row and the F11 key end up here; setting the same
+-- value twice does nothing, so the menu callback that F11's chef.set fires is harmless.
+local function hud_set_visible(on)
+	on = on == true
+	if HUD.visible == on then
+		return
+	end
+	HUD.visible = on
+	if not on and HUD.gui ~= nil and S.session_active then
 		hud_clear_text(HUD.gui)
 		local set_visible = engine_fn("Gui", "set_visible")
 		if set_visible then
@@ -1890,6 +1918,54 @@ local function hud_toggle()
 		end
 	end
 	log(string.format("[DetectionAlert] hud visible=%s", tostring(HUD.visible)))
+end
+
+-- F11. Goes through the menu row, so the menu shows the change and Chef saves it for the next launch.
+local function hud_toggle()
+	local want = not HUD.visible
+	hud_set_visible(want)
+	pcall(chef.set, "hud_visible", want)
+end
+
+-- Options menu, HUD section. Each row's saved value is applied now and again whenever it changes, by
+-- writing it into CFG.hud: hud_lines and hud_draw read CFG.hud every frame, and their cache keys on
+-- text, position and size, so a change is on screen the next frame with nothing else to reset.
+local function menu_row(id, spec, apply)
+	local ok, value = pcall(chef.option, id, spec)
+	if ok and value ~= nil then
+		pcall(apply, value)
+	end
+	pcall(chef.on_change, id, apply)
+end
+
+do
+	local hud = CFG.hud
+	menu_row("hud_visible", { type = "toggle", label = "Show HUD", default = true, heading = "HUD",
+		hint = "F11 toggles this too" }, hud_set_visible)
+	-- Positions are percentages, so a layout survives a change of resolution. y counts up from the bottom,
+	-- as the engine's screen gui does, and is where the top row sits; the rest hang below it.
+	menu_row("hud_x", { type = "slider", label = "Horizontal position (% from left)", min = 0, max = 95, step = 0.5,
+		default = hud.x_fraction * 100 }, function(v) hud.x_fraction = v / 100 end)
+	menu_row("hud_y", { type = "slider", label = "Vertical position (% from bottom)", min = 5, max = 98, step = 0.5,
+		default = hud.y_fraction * 100 }, function(v) hud.y_fraction = v / 100 end)
+	menu_row("hud_scale", { type = "slider", label = "Size (%)", min = 50, max = 200, step = 5,
+		default = hud.scale * 100 }, function(v) hud.scale = v / 100 end)
+
+	-- One switch per element, top to bottom as they are drawn. Hiding every count row hides the rule too.
+	local rows = {
+		{ "hud_title", "show_title", "Title (DETECTION ALERT)" },
+		{ "hud_state", "show_state", "Detection label (DETECTED / SEARCHING / HIDDEN)" },
+		{ "hud_meter", "show_meter", "Detection meter" },
+		{ "hud_near", "show_near", "NEAR" },
+		{ "hud_on_you", "show_alerted", "ON YOU" },
+		{ "hud_team", "show_team", "ON TEAM" },
+		{ "hud_active", "show_active", "ACTIVE" },
+	}
+	for index, row in ipairs(rows) do
+		local field = row[2]
+		menu_row(row[1], { type = "toggle", label = row[3], default = hud[field],
+			heading = index == 1 and "HUD rows" or nil }, function(v) hud[field] = v == true end)
+	end
 end
 
 -- A fault drops our references (the gui is rebuilt on the next draw); too many in a row disarms the HUD
@@ -2068,7 +2144,20 @@ local function refresh_counts()
 	DetectionAlert.team_mode = S.mode
 end
 
+-- The public counts are kept fresh either way; the file is only written while logging is on. Turned off,
+-- the file is closed and left as it is; turned back on, it is reopened, which starts it afresh.
 local function write_status()
+	local ok_counts, counts_err = pcall(refresh_counts)
+	if not ok_counts then
+		log_error("refresh_counts", counts_err)
+	end
+	if not LOG.on then
+		if ST.file then
+			pcall(ST.file.close, ST.file)
+		end
+		ST.file = nil
+		return
+	end
 	if ST.file == nil then
 		open_status_file()
 	elseif ST.file and ST.bytes > CFG.status_max_bytes then
@@ -2077,10 +2166,6 @@ local function write_status()
 	end
 	if not ST.file then
 		return
-	end
-	local ok_counts, counts_err = pcall(refresh_counts)
-	if not ok_counts then
-		log_error("refresh_counts", counts_err)
 	end
 	local c = DetectionAlert.eye_color or CFG.eye.idle
 	local line = string.format(
@@ -2223,8 +2308,9 @@ local function report_environment()
 		tostring(CFG.team_split), CFG.me_radius, CFG.team_radius, CFG.max_anchors, CFG.anchor_grace,
 		tostring(CFG.probe_local_player)))
 	load_probe_state()
-	log(string.format("[DetectionAlert] hud enabled=%s toggle=%s x=%.4f y=%.2f size=%d",
-		tostring(CFG.hud.enabled), CFG.keys.hud_toggle, CFG.hud.x_fraction, CFG.hud.y_fraction, CFG.hud.font_size))
+	log(string.format("[DetectionAlert] hud enabled=%s visible=%s toggle=%s x=%.4f y=%.4f scale=%.2f",
+		tostring(CFG.hud.enabled), tostring(HUD.visible), CFG.keys.hud_toggle, CFG.hud.x_fraction, CFG.hud.y_fraction,
+		CFG.hud.scale))
 	log(string.format("[DetectionAlert] keys: %s=fight start, %s=fight end, %s=team probe, %s=hud",
 		CFG.keys.marker_start, CFG.keys.marker_end, CFG.keys.probe, CFG.keys.hud_toggle))
 end

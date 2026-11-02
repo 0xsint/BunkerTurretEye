@@ -13,8 +13,6 @@ local harness = {}
 -- Stands in for the root of the Chef loader's folder (%APPDATA%\Arrowhead\Helldivers2) inside the sandbox.
 harness.sandbox_root = "<sandbox>"
 harness.log_directory = harness.sandbox_root .. "\\Arrowhead\\Helldivers2"
--- Where the loader kept mod files before it moved them to log_directory: chef.previous_directory.
-harness.previous_directory = harness.sandbox_root .. "\\Local"
 
 -- A log sink that keeps lines in memory instead of writing to disk.
 local function make_log_handle(sink)
@@ -169,26 +167,53 @@ function harness.load(source, chunk_name, world)
 	-- The fake game is installed with rawset, before the recorder below is attached, so it does not
 	-- show up as something the mod created.
 	rawset(env, "stingray", make_stingray(world))
-	-- Chef Shared Loader's helper table, as an addon gets it: its own log file (own_log) and the key reads
-	-- (key_known, key_pressed). Only what the mod calls is here.
-	local chef = {
+	-- Chef Shared Loader's helper table, as an HD2-Addon gets it: passed as the chunk's argument, never set
+	-- as a global (only HD2-Boot scripts get a `chef` global). Its own log file (own_log), the key reads
+	-- (key_known, key_pressed) and the options menu rows (title, option, get, set, on_change); only what the mod calls
+	-- is here. `world.options` seeds a row's saved value, as a player's earlier choice would.
+	-- `calls` counts every call into the loader's logging, so a test can tell "nothing reached Chef".
+	local saved = world.options or {}
+	local options, watchers, calls = {}, {}, { own_log = 0, log = 0 }
+	local chef
+	-- Chef's set_row: a value equal to the current one changes nothing; any other is kept, then its
+	-- watchers run. The menu and chef.set both go through it.
+	local function set_option(id, value)
+		if options[id] == value then return end
+		options[id] = value
+		for _, fn in ipairs(watchers[id] or {}) do fn(value) end
+	end
+	chef = {
 		loader = "Chef Shared Loader",
 		loader_version = "1.5.0",
 		api = 1,
 		log_directory = harness.log_directory,
 		log_file = nil,
-		previous_directory = harness.previous_directory,
 		own_log = function(name)
+			calls.own_log = calls.own_log + 1
 			chef.log_file = harness.log_directory .. "\\" .. name .. ".log"
 			return true
 		end,
 		log = function(fmt, ...)
+			calls.log = calls.log + 1
 			log_lines[#log_lines + 1] = string.format(fmt, ...)
 		end,
 		key_known = function() return true end,
 		key_pressed = function(name) return world.pressed_key == name end,
+		option = function(id, spec)
+			local value = saved[id]
+			if value == nil then value = spec.default end
+			options[id] = value
+			return value
+		end,
+		get = function(id) return options[id] end,
+		set = function(id, value) set_option(id, value); return options[id] end,
+		title = function() end,
+		on_change = function(id, fn)
+			watchers[id] = watchers[id] or {}
+			watchers[id][#watchers[id] + 1] = fn
+			return true
+		end,
 	}
-	rawset(env, "chef", chef)
 	local files = world.files or {}
 	rawset(env, "io", make_io(files, { [status_path] = status_lines }))
 	-- Reads fall through to the real standard library; writes are recorded and kept inside the sandbox,
@@ -206,7 +231,7 @@ function harness.load(source, chunk_name, world)
 		return nil, err
 	end
 	setfenv(chunk, env)
-	local ok, mod = pcall(chunk)
+	local ok, mod = pcall(chunk, chef)
 	if not ok then
 		return nil, mod
 	end
@@ -219,6 +244,9 @@ function harness.load(source, chunk_name, world)
 		status = status_lines,
 		globals = written_globals,
 		world = world,
+		chef_calls = calls,
+		set_option = set_option, -- what the player changing a row in the F9 menu does
+		options = options,
 		update = rawget(env, "update"),
 	}
 end

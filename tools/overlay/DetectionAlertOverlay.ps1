@@ -140,6 +140,7 @@ function Parse-StatusLine([string]$line) {
     $match = [regex]::Match($line, $pattern)
     if (-not $match.Success) { return $null }
     return [PSCustomObject]@{
+        T           = [double]$match.Groups['t'].Value
         Detected    = $match.Groups['d'].Value -eq '1'
         Intensity   = [double]$match.Groups['i'].Value
         R           = [double]$match.Groups['r'].Value
@@ -172,10 +173,25 @@ function Format-Counts($status) {
 }
 
 $lastSeenAt = Get-Date
+# The mod writes a line every 0.5 s while it runs and logging is on. When its t= stops moving -- logging
+# turned off in the game's options menu, or the game closed -- the last line is old news, so show WAITING
+# rather than a state that may no longer hold. Judged by t=, not the file's time: Windows can hold back
+# the modified time of a file the game keeps open.
+$StaleSeconds = 3
+$script:lastT = $null
+$script:lastTChangedAt = Get-Date
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 100
 $timer.Add_Tick({
     $status = Parse-StatusLine (Get-LastStatusLine)
+    if ($null -ne $status) {
+        if ($status.T -ne $script:lastT) {
+            $script:lastT = $status.T
+            $script:lastTChangedAt = Get-Date
+        } elseif (((Get-Date) - $script:lastTChangedAt).TotalSeconds -gt $StaleSeconds) {
+            $status = $null
+        }
+    }
     if ($null -eq $status) {
         $stateLabel.Text = 'WAITING...'
         $stateLabel.ForeColor = $IdleTextColor

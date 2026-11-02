@@ -83,14 +83,11 @@ class Sim:
         rows = [t for t in gui.texts.values()
                 if (t.color.r, t.color.g, t.color.b) != shadow]
         rows.sort(key=lambda t: -t.y)
-        return [{"text": t.text, "size": t.size, "y": t.y,
+        return [{"text": t.text, "size": t.size, "x": t.x, "y": t.y,
                  "color": (t.color.r, t.color.g, t.color.b)} for t in rows]
 
 
 PROBE_PATH_SUFFIX = r"\Arrowhead\Helldivers2\DetectionAlertProbe.txt"
-# Where the probe file lived before Chef: under the old %LOCALAPPDATA% folder, which the loader exposes as
-# chef.previous_directory.
-OLD_PROBE_PATH = r"<sandbox>\Local\CowboyBingus\Helldivers2\Logs\DetectionAlertProbe.txt"
 CONFIRMED_PROBE = "ok unit_num_cameras\n"
 
 
@@ -100,21 +97,22 @@ def probe_path():
 
 def build(lua, harness, *, players=4, local_player_index=1, camera_api=True,
           fatal_camera_api=False, probe_state=CONFIRMED_PROBE,
-          enemies_on_me=0, enemies_on_mate=0, props=40, churning_props=0, old_probe_state=None):
+          enemies_on_me=0, enemies_on_mate=0, props=40, churning_props=0, options=None):
     """Builds a world and loads the mod against it.
 
     `probe_state` seeds the mod's crash-resumable probe file. The default says a previous
     run already confirmed the camera getter, which is the state the mod reaches after one
     successful F7 press. `churning_props` puts unlisted resources right next to you and lets
-    run(churn=("props",)) flip their animation state, which the hash whitelist must ignore."""
+    run(churn=("props",)) flip their animation state, which the hash whitelist must ignore.
+    `options` seeds Chef options-menu rows by id, as a player's saved choices would."""
     files = lua.table()
     if probe_state is not None:
         files[probe_path()] = probe_state
-    if old_probe_state is not None:
-        files[OLD_PROBE_PATH] = old_probe_state
     world = lua.table_from({"units": lua.table(), "session": "fake-session",
                             "camera_api": camera_api, "fatal_camera_api": fatal_camera_api,
                             "files": files})
+    if options:
+        world.options = lua.table_from(options)
     units = world.units
     index = 1
 
@@ -398,17 +396,100 @@ def scenario_fatal_getter_is_not_retried(lua, harness):
     return "read the interrupted trial back as fatal and left it alone"
 
 
-def scenario_probe_record_carries_over(lua, harness):
-    """The probe file moved from %LOCALAPPDATA% into Chef's folder. A record found only in the old place is
-    copied across once, so a getter that killed the game before is still never tried."""
-    sim = build(lua, harness, camera_api=True, fatal_camera_api=True, probe_state=None,
-                old_probe_state="try unit_num_cameras\n", enemies_on_me=10, enemies_on_mate=10)
+def scenario_logging_off_writes_nothing(lua, harness):
+    """The options-menu switch off from the start: not one call reaches Chef's logging, so no
+    DetectionAlert.log is even created, and the status file is never written either. Detection
+    itself carries on: the eye lights and the public counts stay current."""
+    sim = build(lua, harness, options={"logging": False}, enemies_on_me=12, enemies_on_mate=0)
     run(sim, 30)
-    assert sim.grep("probe state unit_num_cameras=fatal"), "did not read the carried-over record as fatal"
-    assert not sim.grep("about to call"), "retried a getter the old record called fatal"
-    carried = sim.world["files"][probe_path()]
-    assert carried and "try unit_num_cameras" in carried, "record did not carry over to the new folder"
-    return "copied the old record across once and left the fatal getter alone"
+    calls = sim.session.chef_calls
+    assert calls.own_log == 0, f"own_log was called {calls.own_log} time(s), so Chef created the log"
+    assert calls.log == 0, f"chef.log was called {calls.log} time(s)"
+    assert len(sim.session.log) == 0, f"{len(sim.session.log)} line(s) were logged"
+    assert len(sim.status()) == 0, f"{len(sim.status())} status line(s) were written"
+    mod = sim.session.mod
+    assert mod.is_detected, "detection stopped with logging off"
+    assert mod.count_source == "hashes" and mod.search_count == 12, "public counts went stale with logging off"
+    return "no own_log, no chef.log, no status file; eye still lit, counts still current"
+
+
+def scenario_logging_toggles_mid_session(lua, harness):
+    """Flipping the switch while playing: off stops the log dead, with no farewell line; on again
+    resumes it, starting with a line that says so."""
+    sim = build(lua, harness, enemies_on_me=12, enemies_on_mate=0)
+    run(sim, 10)
+    assert sim.passes(), "logging on by default should write pass lines"
+    sim.session.set_option("logging", False)
+    before, status_before = len(sim.session.log), len(sim.status())
+    run(sim, 20)
+    assert len(sim.session.log) == before, f"{len(sim.session.log) - before} line(s) written while off"
+    assert len(sim.status()) == status_before, f"{len(sim.status()) - status_before} status line(s) while off"
+    sim.session.set_option("logging", True)
+    run(sim, 10)
+    assert len(sim.status()) > status_before, "status file did not resume"
+    resumed = list(sim.session.log.values())[before:]
+    assert resumed and "logging turned on" in resumed[0], "resumed without saying logging was turned on"
+    assert any(PASS_RE.search(line) for line in resumed), "pass lines did not resume"
+    return f"silent for 20 s, then {len(resumed)} line(s) after turning it back on"
+
+
+def scenario_hud_saved_settings(lua, harness):
+    """The options menu's saved HUD choices: hidden rows are not drawn, and the panel sits and scales
+    where the sliders put it. The fake screen is 1920x1080."""
+    sim = build(lua, harness, enemies_on_me=12, enemies_on_mate=0,
+                options={"hud_state": False, "hud_meter": False, "hud_team": False,
+                         "hud_x": 50, "hud_y": 30, "hud_scale": 200})
+    run(sim, 40)
+    rows = sim.hud()
+    texts = [r["text"] for r in rows]
+    assert texts, "the HUD drew nothing"
+    assert not any("DETECTED" in t or "HIDDEN" in t or "SEARCHING" in t for t in texts), f"state label drawn: {texts}"
+    assert not any(t.startswith("[") for t in texts), f"meter drawn: {texts}"
+    assert not any(t.startswith("ON TEAM") for t in texts), f"ON TEAM drawn: {texts}"
+    for label in ("DETECTION ALERT", "NEAR", "ON YOU", "ACTIVE"):
+        assert any(t.startswith(label) for t in texts), f"{label} missing: {texts}"
+    assert all(r["x"] == 960 for r in rows), f"not at 50% across: {sorted(set(r['x'] for r in rows))}"
+    assert rows[0]["y"] == 324, f"top row not at 30% up: y={rows[0]['y']}"
+    assert rows[0]["size"] == 30, f"title not doubled: size={rows[0]['size']}"
+    return f"{len(texts)} rows at x=960, top y=324, title size 30"
+
+
+def scenario_hud_settings_apply_live(lua, harness):
+    """Changing a HUD row in the menu mid-mission shows on the next frame, and hiding every count
+    row takes the rule with it."""
+    sim = build(lua, harness, enemies_on_me=12, enemies_on_mate=0)
+    run(sim, 40)
+    sim.session.set_option("hud_active", False)
+    sim.session.set_option("hud_x", 25)
+    run(sim, 0.1)
+    rows = sim.hud()
+    texts = [r["text"] for r in rows]
+    assert not any(t.startswith("ACTIVE") for t in texts), f"ACTIVE still drawn: {texts}"
+    assert all(r["x"] == 480 for r in rows), f"did not move to 25%: {sorted(set(r['x'] for r in rows))}"
+    for row_id in ("hud_near", "hud_on_you", "hud_team"):
+        sim.session.set_option(row_id, False)
+    run(sim, 0.1)
+    texts = [r["text"] for r in sim.hud()]
+    assert not any(set(t) == {"-"} for t in texts), f"rule left with no rows under it: {texts}"
+    return " / ".join(texts)
+
+
+def scenario_hud_key_updates_menu(lua, harness):
+    """F11 and the "Show HUD" row are one setting: the key flips the row (so Chef saves it), and the
+    row brings the panel back."""
+    sim = build(lua, harness, enemies_on_me=12, enemies_on_mate=0)
+    run(sim, 20)
+    assert sim.hud(), "the HUD drew nothing before F11"
+    sim.world.pressed_key = "f11"
+    run(sim, DT)
+    sim.world.pressed_key = None
+    run(sim, 0.1)
+    assert sim.session.options["hud_visible"] is False, "F11 did not update the menu row"
+    assert not sim.hud(), "F11 did not hide the HUD"
+    sim.session.set_option("hud_visible", True)
+    run(sim, 0.1)
+    assert sim.hud(), "the menu row did not bring the HUD back"
+    return "F11 hid it and set the row; the row showed it again"
 
 
 SCENARIOS = [
@@ -424,10 +505,14 @@ SCENARIOS = [
     ("losing your anchor mid-fight is survivable", scenario_anchor_lost_midfight),
     ("an unconfirmed getter is never auto-called", scenario_untried_getter_is_never_called),
     ("a getter that killed the game is not retried", scenario_fatal_getter_is_not_retried),
-    ("the probe record carries over to the new folder", scenario_probe_record_carries_over),
     ("the hud draws its rows in order", scenario_hud_layout),
     ("hud counts escalate with the fight", scenario_hud_escalates),
     ("a full run logs no errors", scenario_no_errors),
+    ("logging off writes nothing through Chef", scenario_logging_off_writes_nothing),
+    ("logging can be toggled mid-session", scenario_logging_toggles_mid_session),
+    ("hud follows the saved menu settings", scenario_hud_saved_settings),
+    ("hud menu changes apply mid-mission", scenario_hud_settings_apply_live),
+    ("F11 and the Show HUD row stay in step", scenario_hud_key_updates_menu),
 ]
 
 

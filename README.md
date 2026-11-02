@@ -209,8 +209,21 @@ times rather than once a frame. The gui is not touched while no game session is 
 to hide or show it. If the draw calls fail, the HUD logs one `hud …` line and detection and logging
 carry on; five errors in a row disarm just the HUD.
 
-Position, sizes, colours, escalation points and which rows appear are the `CFG.hud` fields near the top
-of [detection_alert.lua](mods/vixenhunny/detection_alert.lua). `python tools/analysis/simulate.py
+### HUD settings (Chef options menu, F9)
+
+Under **Detection Alert** in Chef's options menu, every change shows on the next frame and Chef saves it:
+
+| row | does |
+| --- | --- |
+| Show HUD | shows or hides the panel; **F11** flips this same setting |
+| Horizontal position | % from the left edge (default 3.75) |
+| Vertical position | % from the bottom, where the top row sits (default 60) |
+| Size | % of the normal size, 50–200, for every row and the gaps between them |
+| HUD rows | one switch each for the title, the detection label (DETECTED / SEARCHING / HIDDEN), the detection meter, NEAR, ON YOU, ON TEAM and ACTIVE. Hiding every count row hides the rule above them too. |
+
+The defaults are the `CFG.hud` fields near the top of
+[detection_alert.lua](mods/vixenhunny/detection_alert.lua); colours and escalation points are set only there.
+`python tools/analysis/simulate.py
 --show` prints the panel for a quiet world, a crowd, and fights on you and on your squad, so a change
 can be eyeballed without launching the game.
 
@@ -237,7 +250,7 @@ is how many of those were within `me_radius` of you, with `count_source=hashes` 
 | --- | --- |
 | **F7** | team probe: dumps what this build exposes, reports how far apart the squad is, and tries **one** untried local-player getter. Does nothing until pressed. |
 | **F9** / **F10** | mark a fight's start / end in the log, for validating the tiers |
-| **F11** | show/hide the HUD |
+| **F11** | show/hide the HUD (the same setting as *Show HUD* in the F9 menu, saved across launches) |
 
 Chef Shared Loader opens its options menu on **F9** by default, the same key as the START MARKER. While that menu is
 open these keys read nothing, but the press that opens the menu may still log a START MARKER. Rebind either one to
@@ -246,6 +259,12 @@ avoid it; this mod's keys are `CFG.keys` in `detection_alert.lua`.
 ## Logs and troubleshooting
 
 Every run writes to `%APPDATA%\Arrowhead\Helldivers2\` (Chef Shared Loader's folder for mod logs):
+
+Logging can be switched off in Chef's options menu (**F9**, *Logging*; default from `CFG.logging`). Off means
+nothing is logged: no `DetectionAlert.log` is created, no line reaches `chef_loader.log`, and
+`DetectionAlertStatus.log` stops being written, so the desktop overlay shows `WAITING...`. It applies at once,
+mid-mission too. Detection and the in-game HUD carry on. Only the probe file is still written, and only when F7
+tries a getter, because it is what stops a call that crashed the game from being tried again.
 
 - **`DetectionAlert.log`** (truncated at each game start). Per pass it writes a `pass` line (unit,
   animated, enemy and per-bucket counts, the resulting flags, and the sampler's CPU time), an
