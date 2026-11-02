@@ -32,7 +32,8 @@
 -- it shares with every other Bingus mod.
 --
 -- Diagnostics: DetectionAlert.log (in %LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs) records the startup
--- checks, a capability probe, every state change, errors, one line per sampler pass, and a heartbeat.
+-- checks, every state change, errors, one line per sampler pass, and a heartbeat. CFG.debug adds the
+-- capability probe, the detail block and the per-callback Wwise dumps.
 
 local DetectionAlert = {
 	is_detected = false,
@@ -71,6 +72,11 @@ local CFG = {
 		ramp_down = 1.0, -- fades out slower
 	},
 
+	-- Diagnostic logging, off by default. When false, the startup probes, the detail block, the per-callback
+	-- Wwise dumps, state transitions and successful key ids are not written at all. The pass, attribution,
+	-- changes, marker, error and heartbeat lines always are: analyze_log.py parses them.
+	debug = false,
+
 	log_dir_suffix = "\\CowboyBingus\\Helldivers2\\Logs\\",
 	log_file = "DetectionAlert.log",
 	status_file = "DetectionAlertStatus.log",
@@ -79,7 +85,7 @@ local CFG = {
 	heartbeat_interval = 5,
 	wwise_detail_limit = 40, -- full argument dumps per Wwise callback
 	wwise_sync_interval = 5,
-	probe_times = { 60 }, -- re-probe here, because mods that load after this one only appear later
+	probe_times = { 60 }, -- debug only: re-probe here, because mods that load after this one only appear later
 
 	-- Sampler walk. A full pass covers every unit in the main world, spread over frames.
 	pass_seconds = 5,
@@ -1201,7 +1207,9 @@ local function log_pass(total)
 		CFG.me_radius, CFG.team_radius))
 	if p.changed > 0 then
 		log(string.format("[DetectionAlert] changes t=%.1f %s", elapsed_time, top_counts(p.change_keys, math.huge)))
-		log(string.format("[DetectionAlert] transitions t=%.1f %s", elapsed_time, top_counts(p.transitions, 16)))
+		if CFG.debug then
+			log(string.format("[DetectionAlert] transitions t=%.1f %s", elapsed_time, top_counts(p.transitions, 16)))
+		end
 	end
 
 	S.last_pass = { total = total, units = p.units, animated = p.animated, changed = p.changed,
@@ -1225,13 +1233,15 @@ local function sample_unit(unit)
 	local resource = engine_call("Unit", "resource_name", unit)
 	if resource ~= nil and S.resource_mode == nil then
 		S.resource_mode = choose_resource_mode(resource)
-		log(string.format("[DetectionAlert]   resource sample: type=%s value=%s mode=%s",
-			type(resource), describe_state(resource), S.resource_mode))
+		if CFG.debug then
+			log(string.format("[DetectionAlert]   resource sample: type=%s value=%s mode=%s",
+				type(resource), describe_state(resource), S.resource_mode))
+		end
 	end
 	if resource ~= nil and S.resource_mode ~= nil then
 		count_into(DT.resources, resource_key(resource, S.resource_mode))
 	end
-	if not S.diagnostics_logged then
+	if CFG.debug and not S.diagnostics_logged then
 		S.diagnostics_logged = true
 		log("[DetectionAlert]   debug_name sample: " .. describe_state(engine_call("Unit", "debug_name", unit)))
 	end
@@ -1284,7 +1294,9 @@ local function sample_unit(unit)
 		S.changes_total = S.changes_total + 1
 		local label = enemy_label(hash)
 		count_into(p.change_keys, label)
-		count_into(p.transitions, label .. ":" .. previous .. ">" .. state)
+		if CFG.debug then
+			count_into(p.transitions, label .. ":" .. previous .. ">" .. state)
+		end
 	end
 	if CFG.ambient_hashes[hash] then
 		if changed then
@@ -1347,19 +1359,21 @@ local function sample_enemies(dt)
 
 	if elapsed_time >= S.next_detail then
 		S.next_detail = elapsed_time + CFG.detail_interval
-		log(string.format("[DetectionAlert] sample t=%.1f wall=%s total=%d units=%d animated=%d changed=%d changed_total=%d",
-			elapsed_time, wall_clock(), total, DT.units, DT.animated, DT.changed, S.changes_total))
-		log("[DetectionAlert]   states: " .. top_counts(DT.states))
-		log("[DetectionAlert]   resources: " .. top_counts(DT.resources))
-		-- Animated units that are neither a player nor in ENEMY. Mostly props, sentries and hellpods, but
-		-- a hash climbing this list after a game patch is a new enemy type missing from the whitelist.
-		log("[DetectionAlert]   unlisted animated: " .. top_counts(DT.unknown))
-		log("[DetectionAlert]   calm model: " .. calm_model_summary())
-		local spread = anchor_spread()
-		log(string.format("[DetectionAlert]   team: mode=%s basis=%s anchors=%d spread=%s me_radius=%d team_radius=%d alerted_mate=%d",
-			S.mode, S.me_basis, #S.anchors,
-			spread and string.format("%.0fm", spread) or "?",
-			CFG.me_radius, CFG.team_radius, SC.mate.alerted))
+		if CFG.debug then
+			log(string.format("[DetectionAlert] sample t=%.1f wall=%s total=%d units=%d animated=%d changed=%d changed_total=%d",
+				elapsed_time, wall_clock(), total, DT.units, DT.animated, DT.changed, S.changes_total))
+			log("[DetectionAlert]   states: " .. top_counts(DT.states))
+			log("[DetectionAlert]   resources: " .. top_counts(DT.resources))
+			-- Animated units that are neither a player nor in ENEMY. Mostly props, sentries and hellpods, but
+			-- a hash climbing this list after a game patch is a new enemy type missing from the whitelist.
+			log("[DetectionAlert]   unlisted animated: " .. top_counts(DT.unknown))
+			log("[DetectionAlert]   calm model: " .. calm_model_summary())
+			local spread = anchor_spread()
+			log(string.format("[DetectionAlert]   team: mode=%s basis=%s anchors=%d spread=%s me_radius=%d team_radius=%d alerted_mate=%d",
+				S.mode, S.me_basis, #S.anchors,
+				spread and string.format("%.0fm", spread) or "?",
+				CFG.me_radius, CFG.team_radius, SC.mate.alerted))
+		end
 		DT.units, DT.animated, DT.changed = 0, 0, 0
 		DT.states, DT.resources, DT.unknown = {}, {}, {}
 	end
@@ -1495,7 +1509,10 @@ local function poll_keys()
 		KEYS.ready = true
 		for _, key in ipairs(KEYS.list) do
 			key.id = engine_call("Keyboard", "button_id", key.name)
-			log(string.format("[DetectionAlert] key %s id=%s (%s)", key.name, tostring(key.id), key.label))
+			-- A key that fails to bind is always logged; the ones that bind are only logged in debug.
+			if CFG.debug or key.id == nil then
+				log(string.format("[DetectionAlert] key %s id=%s (%s)", key.name, tostring(key.id), key.label))
+			end
 		end
 	end
 	for _, key in ipairs(KEYS.list) do
@@ -1958,7 +1975,7 @@ local function on_wwise_call(label, signal, count, ...)
 		return
 	end
 	local detail = describe_arguments(...)
-	if count <= CFG.wwise_detail_limit then
+	if CFG.debug and count <= CFG.wwise_detail_limit then
 		log(string.format("[DetectionAlert] t=%.2f call %s #%d: %s", elapsed_time, label, count, detail))
 	end
 	if signal then
@@ -1996,8 +2013,10 @@ local function hook_wwise_table(table_name, callbacks)
 		end
 	end
 	table.sort(names)
-	log(string.format("[DetectionAlert] %s: wrapped %d function(s), %d detection-signal; members: %s",
-		table_name, hooked, signals, table.concat(names, ", ")))
+	if CFG.debug then
+		log(string.format("[DetectionAlert] %s: wrapped %d function(s), %d detection-signal; members: %s",
+			table_name, hooked, signals, table.concat(names, ", ")))
+	end
 end
 
 -- Runs at startup and every CFG.wwise_sync_interval: hooks tables that appeared later and re-hooks any
@@ -2141,9 +2160,11 @@ local function tick(dt)
 		if S.session_active and not S.session_probe_done then
 			S.session_probe_done = true
 			log(string.format("[DetectionAlert] game session detected at t=%.1f", elapsed_time))
-			local ok, err = pcall(run_probe)
-			if not ok then
-				log_error("probe", err)
+			if CFG.debug then
+				local ok, err = pcall(run_probe)
+				if not ok then
+					log_error("probe", err)
+				end
 			end
 		end
 	end
@@ -2173,7 +2194,7 @@ local function tick(dt)
 		hud_guarded_tick()
 	end
 
-	if S.probe_index <= #CFG.probe_times and elapsed_time >= CFG.probe_times[S.probe_index] then
+	if CFG.debug and S.probe_index <= #CFG.probe_times and elapsed_time >= CFG.probe_times[S.probe_index] then
 		S.probe_index = S.probe_index + 1
 		local ok, err = pcall(run_probe)
 		if not ok then
