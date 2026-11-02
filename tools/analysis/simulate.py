@@ -87,7 +87,10 @@ class Sim:
                  "color": (t.color.r, t.color.g, t.color.b)} for t in rows]
 
 
-PROBE_PATH_SUFFIX = r"\CowboyBingus\Helldivers2\Logs\DetectionAlertProbe.txt"
+PROBE_PATH_SUFFIX = r"\Arrowhead\Helldivers2\DetectionAlertProbe.txt"
+# Where the probe file lived before Chef: under the old %LOCALAPPDATA% folder, which the loader exposes as
+# chef.previous_directory.
+OLD_PROBE_PATH = r"<sandbox>\Local\CowboyBingus\Helldivers2\Logs\DetectionAlertProbe.txt"
 CONFIRMED_PROBE = "ok unit_num_cameras\n"
 
 
@@ -97,7 +100,7 @@ def probe_path():
 
 def build(lua, harness, *, players=4, local_player_index=1, camera_api=True,
           fatal_camera_api=False, probe_state=CONFIRMED_PROBE,
-          enemies_on_me=0, enemies_on_mate=0, props=40, churning_props=0):
+          enemies_on_me=0, enemies_on_mate=0, props=40, churning_props=0, old_probe_state=None):
     """Builds a world and loads the mod against it.
 
     `probe_state` seeds the mod's crash-resumable probe file. The default says a previous
@@ -107,6 +110,8 @@ def build(lua, harness, *, players=4, local_player_index=1, camera_api=True,
     files = lua.table()
     if probe_state is not None:
         files[probe_path()] = probe_state
+    if old_probe_state is not None:
+        files[OLD_PROBE_PATH] = old_probe_state
     world = lua.table_from({"units": lua.table(), "session": "fake-session",
                             "camera_api": camera_api, "fatal_camera_api": fatal_camera_api,
                             "files": files})
@@ -393,6 +398,19 @@ def scenario_fatal_getter_is_not_retried(lua, harness):
     return "read the interrupted trial back as fatal and left it alone"
 
 
+def scenario_probe_record_carries_over(lua, harness):
+    """The probe file moved from %LOCALAPPDATA% into Chef's folder. A record found only in the old place is
+    copied across once, so a getter that killed the game before is still never tried."""
+    sim = build(lua, harness, camera_api=True, fatal_camera_api=True, probe_state=None,
+                old_probe_state="try unit_num_cameras\n", enemies_on_me=10, enemies_on_mate=10)
+    run(sim, 30)
+    assert sim.grep("probe state unit_num_cameras=fatal"), "did not read the carried-over record as fatal"
+    assert not sim.grep("about to call"), "retried a getter the old record called fatal"
+    carried = sim.world["files"][probe_path()]
+    assert carried and "try unit_num_cameras" in carried, "record did not carry over to the new folder"
+    return "copied the old record across once and left the fatal getter alone"
+
+
 SCENARIOS = [
     ("quiet world stays hidden", scenario_quiet),
     ("unlisted resources never count", scenario_unlisted_resources_are_ignored),
@@ -406,6 +424,7 @@ SCENARIOS = [
     ("losing your anchor mid-fight is survivable", scenario_anchor_lost_midfight),
     ("an unconfirmed getter is never auto-called", scenario_untried_getter_is_never_called),
     ("a getter that killed the game is not retried", scenario_fatal_getter_is_not_retried),
+    ("the probe record carries over to the new folder", scenario_probe_record_carries_over),
     ("the hud draws its rows in order", scenario_hud_layout),
     ("hud counts escalate with the fight", scenario_hud_escalates),
     ("a full run logs no errors", scenario_no_errors),

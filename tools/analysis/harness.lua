@@ -2,7 +2,7 @@
 -- detection logic can be exercised on a desktop, with no game and no files touched.
 --
 -- It gives the mod a sandboxed _G, records every global the mod writes (anything it
--- writes is a name another Bingus mod could collide with), fakes the stingray engine
+-- writes is a global the mod should not leave behind), fakes the stingray engine
 -- tables the sampler uses, and drives update(dt) over a scripted scenario.
 --
 -- Scenario format (see simulate.lua): a list of phases, each naming how many enemies
@@ -10,8 +10,11 @@
 
 local harness = {}
 
--- Stands in for %LOCALAPPDATA% inside the sandbox.
+-- Stands in for the root of the Chef loader's folder (%APPDATA%\Arrowhead\Helldivers2) inside the sandbox.
 harness.sandbox_root = "<sandbox>"
+harness.log_directory = harness.sandbox_root .. "\\Arrowhead\\Helldivers2"
+-- Where the loader kept mod files before it moved them to log_directory: chef.previous_directory.
+harness.previous_directory = harness.sandbox_root .. "\\Local"
 
 -- A log sink that keeps lines in memory instead of writing to disk.
 local function make_log_handle(sink)
@@ -26,9 +29,9 @@ local function make_log_handle(sink)
 end
 
 -- An in-memory stand-in for `io`, so the mod's probe-state file never touches the real
--- %LOCALAPPDATA%. `files` maps a path to its contents; a scenario can seed it to replay what a
+-- Chef's log folder. `files` maps a path to its contents; a scenario can seed it to replay what a
 -- previous run (or a run that crashed mid-probe) left behind, and read it back afterwards.
-local function make_io(files)
+local function make_io(files, sinks)
 	local function handle_for(path, append)
 		if not append then
 			files[path] = ""
@@ -44,6 +47,9 @@ local function make_io(files)
 	return {
 		open = function(path, mode)
 			mode = mode or "r"
+			if sinks[path] then
+				return make_log_handle(sinks[path])
+			end
 			if mode:find("r", 1, true) then
 				local body = files[path]
 				if body == nil then
@@ -146,10 +152,6 @@ local function make_stingray(world)
 		Network = {
 			game_session = function() return world.session end,
 		},
-		Keyboard = {
-			button_id = function(name) return name end,
-			pressed = function(id) return world.pressed_key == id end,
-		},
 	}
 	return stingray
 end
@@ -159,6 +161,7 @@ end
 function harness.load(source, chunk_name, world)
 	local log_lines, status_lines = {}, {}
 	local written_globals = {}
+	local status_path = harness.log_directory .. "\\DetectionAlertStatus.log"
 
 	local env = {}
 	local real = _G
@@ -166,27 +169,28 @@ function harness.load(source, chunk_name, world)
 	-- The fake game is installed with rawset, before the recorder below is attached, so it does not
 	-- show up as something the mod created.
 	rawset(env, "stingray", make_stingray(world))
-	rawset(env, "CowboyBingusModLoader", {
+	-- Chef Shared Loader's helper table, as an addon gets it: its own log file (own_log) and the key reads
+	-- (key_known, key_pressed). Only what the mod calls is here.
+	local chef = {
+		loader = "Chef Shared Loader",
+		loader_version = "1.5.0",
 		api = 1,
-		version = 17,
-		revision = "harness",
-		log_directory = "<memory>",
-		open_log = function(name)
-			return make_log_handle(name == "DetectionAlertStatus.log" and status_lines or log_lines)
+		log_directory = harness.log_directory,
+		log_file = nil,
+		previous_directory = harness.previous_directory,
+		own_log = function(name)
+			chef.log_file = harness.log_directory .. "\\" .. name .. ".log"
+			return true
 		end,
-	})
+		log = function(fmt, ...)
+			log_lines[#log_lines + 1] = string.format(fmt, ...)
+		end,
+		key_known = function() return true end,
+		key_pressed = function(name) return world.pressed_key == name end,
+	}
+	rawset(env, "chef", chef)
 	local files = world.files or {}
-	rawset(env, "io", make_io(files))
-	-- A fixed LOCALAPPDATA, so the probe-state path is deterministic and can never be the real one
-	-- (the test shell does not even export the variable).
-	local real_os = os
-	rawset(env, "os", setmetatable({
-		getenv = function(name)
-			if name == "LOCALAPPDATA" then return harness.sandbox_root end
-			return real_os.getenv(name)
-		end,
-	}, { __index = real_os }))
-
+	rawset(env, "io", make_io(files, { [status_path] = status_lines }))
 	-- Reads fall through to the real standard library; writes are recorded and kept inside the sandbox,
 	-- so the mod can never touch the harness's own globals.
 	setmetatable(env, {

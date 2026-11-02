@@ -26,14 +26,16 @@
 -- When you cannot be identified, every anchor counts as you and basis= says so, so the eye keeps working
 -- exactly as it did before rather than going dark.
 --
+-- Runs under Chef Shared Loader (1.5.0+). Chef gives this file its own environment and a `chef` table of
+-- helpers (its own log, the keys, the once-a-frame update() call), so nothing here reaches for another mod.
+--
 -- Targets plain Lua 5.1.4 (current builds have no LuaJIT): no 5.2+ syntax or library calls, and the main
 -- chunk must stay under 200 locals, which is why the constants and state below live in grouped tables.
--- tools/analysis/check_lua51.py enforces both, plus that this file leaks no globals into the environment
--- it shares with every other Bingus mod.
+-- tools/analysis/check_lua51.py enforces both, plus that this file defines no globals beyond update().
 --
--- Diagnostics: DetectionAlert.log (in %LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs) records the startup
--- checks, every state change, errors, one line per sampler pass, and a heartbeat. CFG.debug adds the
--- capability probe, the detail block and the per-callback Wwise dumps.
+-- Diagnostics: DetectionAlert.log (in %APPDATA%\Arrowhead\Helldivers2, the folder Chef keeps mod logs in)
+-- records the startup checks, every state change, errors, one line per sampler pass, and a heartbeat.
+-- CFG.debug adds the capability probe, the detail block and the per-callback Wwise dumps.
 
 local DetectionAlert = {
 	is_detected = false,
@@ -72,13 +74,13 @@ local CFG = {
 		ramp_down = 1.0, -- fades out slower
 	},
 
-	-- Diagnostic logging, off by default. When false, the startup probes, the detail block, the per-callback
-	-- Wwise dumps, state transitions and successful key ids are not written at all. The pass, attribution,
-	-- changes, marker, error and heartbeat lines always are: analyze_log.py parses them.
+	-- Diagnostic logging, off by default. When false, the startup probes, the detail block (apart from its
+	-- unlisted animated line), the per-callback Wwise dumps, state transitions and successful key ids are not
+	-- written at all. The pass, attribution, changes, marker, error and heartbeat lines always are: analyze_log.py
+	-- parses them.
 	debug = false,
 
-	log_dir_suffix = "\\CowboyBingus\\Helldivers2\\Logs\\",
-	log_file = "DetectionAlert.log",
+	log_name = "DetectionAlert", -- chef.own_log adds the .log
 	status_file = "DetectionAlertStatus.log",
 	status_max_bytes = 64 * 1024, -- the overlay re-reads this file every tick, so keep it small
 	status_interval = 0.5,
@@ -365,32 +367,9 @@ CFG.hud.counts.active = { warn = CFG.search.enter, hot = CFG.detect.enter }
 
 local elapsed_time = 0
 
--- Logging: both files are opened through the loader's open_log when it offers one, otherwise directly in
--- the loader's log folder. A line that cannot reach a file goes to the console.
-local LOG = { file = nil, target = "not opened yet", errors = 0 } -- file: nil = not tried, false = unavailable
-
--- Returns an open file handle and where it points, or nil and the reason it could not open.
-local function open_log_file(file_name)
-	local loader = rawget(_G, "CowboyBingusModLoader")
-	if type(loader) == "table" and type(loader.open_log) == "function" then
-		local ok, handle = pcall(loader.open_log, file_name)
-		if ok and handle then
-			return handle, "CowboyBingusModLoader.open_log(" .. file_name .. ")"
-		end
-	end
-	if type(os) == "table" and type(os.getenv) == "function" and type(io) == "table" and type(io.open) == "function" then
-		local base = os.getenv("LOCALAPPDATA")
-		if base then
-			local path = base .. CFG.log_dir_suffix .. file_name
-			local handle = io.open(path, "w")
-			if handle then
-				return handle, path
-			end
-			return nil, "io.open failed for " .. path
-		end
-	end
-	return nil, "no loader open_log, and no io/os access to LOCALAPPDATA"
-end
+-- Logging: chef.own_log gives the mod its own file in Chef's folder, and chef.log writes to it from then on.
+-- If that file cannot be opened, chef.log still takes the lines, into the loader's shared log instead.
+local LOG = { opened = false, target = "not opened yet", errors = 0 }
 
 local function write_line(handle, text)
 	handle:write(text, "\n")
@@ -398,21 +377,13 @@ local function write_line(handle, text)
 end
 
 local function log(text)
-	if LOG.file == nil then
-		local handle, target = open_log_file(CFG.log_file)
-		LOG.file = handle or false
-		LOG.target = handle and target or ("unavailable: " .. target)
+	if not LOG.opened then
+		LOG.opened = true
+		local ok, opened, err = pcall(chef.own_log, CFG.log_name)
+		LOG.target = (ok and opened == true) and chef.log_file
+			or ("chef_loader.log (own_log: " .. tostring(err or opened) .. ")")
 	end
-	if LOG.file then
-		if pcall(write_line, LOG.file, text) then
-			return
-		end
-		LOG.file = false
-		LOG.target = "unavailable: write failed"
-	end
-	if type(print) == "function" then
-		print(text)
-	end
+	pcall(chef.log, "%s", text)
 end
 
 local function log_error(where, err)
@@ -768,11 +739,28 @@ end
 local PROBE = { status = {}, loaded = false, path = nil }
 
 local function probe_state_path()
-	if type(os) ~= "table" or type(os.getenv) ~= "function" then
-		return nil
+	return chef.log_directory .. "\\" .. CFG.probe_state_file
+end
+
+-- The probe file used to live in %LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs. A record found only there is
+-- copied into Chef's folder once, so a getter already recorded as fatal is still never tried.
+local function carry_probe_state()
+	if chef.previous_directory == nil then
+		return
 	end
-	local base = os.getenv("LOCALAPPDATA")
-	return base and (base .. CFG.log_dir_suffix .. CFG.probe_state_file) or nil
+	local ok, old = pcall(io.open, chef.previous_directory .. "\\CowboyBingus\\Helldivers2\\Logs\\" .. CFG.probe_state_file, "r")
+	if not ok or not old then
+		return
+	end
+	local body = old:read("*a")
+	old:close()
+	if type(body) == "string" and body ~= "" then
+		local opened, out = pcall(io.open, PROBE.path, "w")
+		if opened and out then
+			out:write(body)
+			out:close()
+		end
+	end
 end
 
 local function load_probe_state()
@@ -785,6 +773,11 @@ local function load_probe_state()
 	if PROBE.path ~= nil and type(io) == "table" and type(io.open) == "function" then
 		local ok, opened = pcall(io.open, PROBE.path, "r")
 		handle = ok and opened or nil
+		if handle == nil then
+			carry_probe_state()
+			ok, opened = pcall(io.open, PROBE.path, "r")
+			handle = ok and opened or nil
+		end
 	end
 	if handle ~= nil then
 		pcall(function()
@@ -1364,9 +1357,6 @@ local function sample_enemies(dt)
 				elapsed_time, wall_clock(), total, DT.units, DT.animated, DT.changed, S.changes_total))
 			log("[DetectionAlert]   states: " .. top_counts(DT.states))
 			log("[DetectionAlert]   resources: " .. top_counts(DT.resources))
-			-- Animated units that are neither a player nor in ENEMY. Mostly props, sentries and hellpods, but
-			-- a hash climbing this list after a game patch is a new enemy type missing from the whitelist.
-			log("[DetectionAlert]   unlisted animated: " .. top_counts(DT.unknown))
 			log("[DetectionAlert]   calm model: " .. calm_model_summary())
 			local spread = anchor_spread()
 			log(string.format("[DetectionAlert]   team: mode=%s basis=%s anchors=%d spread=%s me_radius=%d team_radius=%d alerted_mate=%d",
@@ -1374,6 +1364,9 @@ local function sample_enemies(dt)
 				spread and string.format("%.0fm", spread) or "?",
 				CFG.me_radius, CFG.team_radius, SC.mate.alerted))
 		end
+		-- Not debug-only: animated units that are neither a player nor in ENEMY. Mostly props, sentries and
+		-- hellpods, but a hash climbing this list after a game patch is a new enemy type missing from the whitelist.
+		log("[DetectionAlert]   unlisted animated: " .. top_counts(DT.unknown))
 		DT.units, DT.animated, DT.changed = 0, 0, 0
 		DT.states, DT.resources, DT.unknown = {}, {}, {}
 	end
@@ -1458,15 +1451,8 @@ local function run_probe()
 	log(string.format("[DetectionAlert]   runtime: _VERSION=%s jit=%s ffi=%s bit=%s",
 		tostring(_VERSION), type(jit_table), type(rawget(_G, "ffi")), type(rawget(_G, "bit"))))
 
-	local loader = rawget(_G, "CowboyBingusModLoader")
-	if type(loader) == "table" then
-		log("[DetectionAlert]   loader: " .. scalar_fields(loader))
-		if type(loader.jit) == "table" then
-			log("[DetectionAlert]   loader.jit: " .. scalar_fields(loader.jit))
-		end
-	else
-		log("[DetectionAlert]   CowboyBingusModLoader=" .. type(loader))
-	end
+	log("[DetectionAlert]   loader: " .. chef.loader .. " " .. chef.loader_version .. " api=" .. tostring(chef.api))
+	log("[DetectionAlert]   chef: " .. scalar_fields(chef))
 
 	log(string.format("[DetectionAlert]   enemy whitelist: %d resource hashes", ENEMY_COUNT))
 
@@ -1501,23 +1487,24 @@ end
 local KEYS = { ready = false, list = {} }
 
 local function key_entry(name, label, handler)
-	KEYS.list[#KEYS.list + 1] = { name = name, label = label, handler = handler, id = nil, down = false }
+	KEYS.list[#KEYS.list + 1] = { name = name, label = label, handler = handler, known = false, down = false }
 end
 
+-- chef.key_pressed answers false while Chef's own menu is open, so typing in it does not fire these.
 local function poll_keys()
 	if not KEYS.ready and elapsed_time >= 1 then
 		KEYS.ready = true
 		for _, key in ipairs(KEYS.list) do
-			key.id = engine_call("Keyboard", "button_id", key.name)
-			-- A key that fails to bind is always logged; the ones that bind are only logged in debug.
-			if CFG.debug or key.id == nil then
-				log(string.format("[DetectionAlert] key %s id=%s (%s)", key.name, tostring(key.id), key.label))
+			key.known = chef.key_known(key.name)
+			-- A key name the game does not know is always logged; the ones it knows are only logged in debug.
+			if CFG.debug or not key.known then
+				log(string.format("[DetectionAlert] key %s known=%s (%s)", key.name, tostring(key.known), key.label))
 			end
 		end
 	end
 	for _, key in ipairs(KEYS.list) do
-		if key.id ~= nil then
-			local pressed = engine_call("Keyboard", "pressed", key.id) == true
+		if key.known then
+			local pressed = chef.key_pressed(key.name) == true
 			if pressed and not key.down then
 				local ok, err = pcall(key.handler)
 				if not ok then
@@ -2051,12 +2038,13 @@ end
 local ST = { file = nil, bytes = 0, announced = false, last_write = -math.huge }
 
 local function open_status_file()
-	local handle, target = open_log_file(CFG.status_file)
-	ST.file = handle or false
+	local path = chef.log_directory .. "\\" .. CFG.status_file
+	local ok, handle, err = pcall(io.open, path, "w")
+	ST.file = (ok and handle) or false
 	ST.bytes = 0
 	if not ST.announced then
 		ST.announced = true
-		log("[DetectionAlert] status file: " .. (handle and target or ("unavailable: " .. target)))
+		log("[DetectionAlert] status file: " .. (ST.file and path or ("unavailable: " .. tostring(err or handle))))
 	end
 end
 
@@ -2206,28 +2194,24 @@ end
 -- Gameplay mods wrap the global `update` (the loader's overlay module does the same). Chain to any
 -- existing `update` so other mods' ticks keep running, and keep our own errors out of the game's tick.
 local function install_update_hook()
-	local previous_update = rawget(_G, "update")
-	_G.update = function(dt, ...)
-		if previous_update then
-			previous_update(dt, ...)
-		end
+	-- Chef calls this addon's update() once a frame, in this mod's environment alone, so there is no previous
+	-- update to chain to. Our own errors stay out of the game's tick.
+	_G.update = function(dt)
 		local ok, err = pcall(tick, tonumber(dt) or 0)
 		if not ok then
 			log_error("update tick", err)
 		end
 	end
-	log("[DetectionAlert] update hook installed; previous update() " .. (previous_update and "chained" or "absent"))
+	log("[DetectionAlert] update hook installed")
 end
 
 local function report_environment()
-	local loader = rawget(_G, "CowboyBingusModLoader")
 	log(string.format("[DetectionAlert] start: %s, t=%.2f", tostring(_VERSION), elapsed_time))
 	log(string.format(
-		"[DetectionAlert] env: CowboyBingusModLoader=%s open_log=%s WwiseFlowCallbacks=%s WwiseVisualization=%s update=%s io=%s os.getenv=%s",
-		type(loader), type(loader) == "table" and type(loader.open_log) or "n/a",
+		"[DetectionAlert] env: loader=%s %s api=%s WwiseFlowCallbacks=%s WwiseVisualization=%s update=%s io=%s",
+		chef.loader, chef.loader_version, tostring(chef.api),
 		type(rawget(_G, "WwiseFlowCallbacks")), type(rawget(_G, "WwiseVisualization")),
-		type(rawget(_G, "update")), type(rawget(_G, "io")),
-		(type(os) == "table" and type(os.getenv)) or "n/a"))
+		type(rawget(_G, "update")), type(rawget(_G, "io"))))
 	log("[DetectionAlert] log file: " .. tostring(LOG.target))
 	log(string.format("[DetectionAlert] enemies: %d whitelisted resource hashes; units outside the list are never counted",
 		ENEMY_COUNT))

@@ -3,9 +3,8 @@
     Always-on-top desktop overlay for the Detection Alert mod's turret eye.
 
 .DESCRIPTION
-    Bingus Shared Loader doesn't expose a safe in-game HUD/draw API, so
-    detection_alert.lua instead writes its live state to
-    %LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs\DetectionAlertStatus.log (one line per
+    The in-game HUD draws through the engine's Gui calls, so detection_alert.lua also writes its live state to
+    %APPDATA%\Arrowhead\Helldivers2\DetectionAlertStatus.log (Chef Shared Loader's folder for mod logs, one line per
     tick, throttled). This script polls that file's last line and renders a small
     borderless, always-on-top window showing the turret eye glow outside the game window.
 
@@ -25,7 +24,7 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-$StatusPath = Join-Path $env:LOCALAPPDATA 'CowboyBingus\Helldivers2\Logs\DetectionAlertStatus.log'
+$StatusPath = Join-Path $env:APPDATA 'Arrowhead\Helldivers2\DetectionAlertStatus.log'
 
 # Dark navy backdrop, matches the mod's own red-ember/alert eye theme.
 $BackdropColor = [System.Drawing.Color]::FromArgb(230, 10, 14, 26)

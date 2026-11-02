@@ -2,7 +2,7 @@
 
 Shows an on-screen "DETECTED" / "HIDDEN" indicator (and drives a turret-eye glow) from a
 combat-activity heuristic, and splits that activity into **enemies on you** and **enemies on your
-squad**. Built for [Bingus Shared Loader](https://github.com/CowboyBingus/BingusSharedLoader) v21+.
+squad**. Built for [Chef Shared Loader](https://github.com/Th3chef/Chef-Shared-Loader) 1.5.0+.
 
 ## Detection sources
 
@@ -217,7 +217,7 @@ can be eyeballed without launching the game.
 ## Desktop overlay
 
 The mod writes its live eye state to
-`%LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs\DetectionAlertStatus.log` (one throttled line every
+`%APPDATA%\Arrowhead\Helldivers2\DetectionAlertStatus.log` (one throttled line every
 0.5 s). [tools/overlay/DetectionAlertOverlay.ps1](tools/overlay/DetectionAlertOverlay.ps1) is a small
 always-on-top window (PowerShell + WinForms, no extra install) that tails it:
 
@@ -239,9 +239,13 @@ is how many of those were within `me_radius` of you, with `count_source=hashes` 
 | **F9** / **F10** | mark a fight's start / end in the log, for validating the tiers |
 | **F11** | show/hide the HUD |
 
+Chef Shared Loader opens its options menu on **F9** by default, the same key as the START MARKER. While that menu is
+open these keys read nothing, but the press that opens the menu may still log a START MARKER. Rebind either one to
+avoid it; this mod's keys are `CFG.keys` in `detection_alert.lua`.
+
 ## Logs and troubleshooting
 
-Every run writes to `%LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs\`:
+Every run writes to `%APPDATA%\Arrowhead\Helldivers2\` (Chef Shared Loader's folder for mod logs):
 
 - **`DetectionAlert.log`** (truncated at each game start). Per pass it writes a `pass` line (unit,
   animated, enemy and per-bucket counts, the resulting flags, and the sampler's CPU time), an
@@ -268,7 +272,7 @@ Where to look when it misbehaves:
 - `spread=` staying small: your squad is standing together, so there is little for the split to
   separate. Note also that the client appears to animate only units near you (17,000 units in the
   world, ~400 animated), so enemies fighting a distant teammate may never reach the sampler at all.
-- `wwise_calls=0`: no Wwise callback reached the mod — expected on loader v21+.
+- `wwise_calls=0`: no Wwise callback reached the mod — expected on current builds.
 - `status_bytes=0`, or the status log empty: look for `status file: first write ok`.
 - `ERROR #n in <where>`: a handler failed; the message names the file and line.
 
@@ -279,14 +283,14 @@ Four tools, none of which need the game running:
 ```
 python tools/analysis/check_lua51.py mods/vixenhunny/detection_alert.lua
 python tools/analysis/simulate.py
-python tools/analysis/analyze_log.py "%LOCALAPPDATA%\CowboyBingus\Helldivers2\Logs\DetectionAlert.log"
+python tools/analysis/analyze_log.py "%APPDATA%\Arrowhead\Helldivers2\DetectionAlert.log"
 python tools/gen_enemy_hashes.py --enemy-data <path to an EnemyData checkout>
 ```
 
 - **`check_lua51.py`** compiles the mod against a real Lua 5.1 runtime, counts the locals the main
   chunk holds open, and loads it under a fake game to catch any global it leaks. Current builds run
-  plain Lua 5.1.4: a chunk may hold **at most 200 locals**, and `_G` is shared with every other Bingus
-  mod, so both matter. (The pre-revamp file was over that limit, which is why 35 of its declarations
+  plain Lua 5.1.4: a chunk may hold **at most 200 locals**, and it should define no globals beyond
+  `update`, so both matter. (The pre-revamp file was over that limit, which is why 35 of its declarations
   had their `local` stripped and leaked names like `tick` and `heartbeat` into `_G`.)
 - **`simulate.py`** loads the real mod source into `harness.lua`'s fake Helldivers 2 and drives
   scripted squad scenarios — a fight on you, a fight on a squadmate 300 m away, both at once, idle
@@ -308,5 +312,5 @@ Both gates must pass before shipping.
 python .\tools\build_addon.py --name mods/vixenhunny/detection_alert --entry .\mods\vixenhunny\detection_alert.lua --guid 2b06f66a-6f03-4ca4-8b67-6fc2a153e19a --display-name "Detection Alert" --output .\dist\Detection-Alert.zip
 ```
 
-Reuse that GUID for every update. Distribute the ZIP alongside a requirement on Bingus Shared Loader
-v21+; players enable both in Arsenal/HD2MM (loader placed last in load order) and deploy.
+Reuse that GUID for every update. Distribute the ZIP alongside a requirement on Chef Shared Loader
+1.5.0+; players enable both in Arsenal/HD2MM and deploy. Chef asks to be kept at the highest priority.

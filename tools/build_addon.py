@@ -1,9 +1,9 @@
-"""Standalone re-implementation of Bingus Shared Loader's addon packaging,
-so a mod's compiled Stingray resource/archive layout can be built and
-inspected without checking out the full loader repository.
+"""Standalone implementation of the addon packaging the Stingray Lua loaders share (the
+"-- HD2-Addon:" marker and the Addon/ archive layout), so a mod's compiled Stingray
+resource/archive layout can be built and inspected without checking out a loader repository.
 
-Matches scripts/build_addon.py and scripts/archive.py from
-https://github.com/CowboyBingus/BingusSharedLoader (as of loader v18).
+First written against scripts/build_addon.py and scripts/archive.py from
+https://github.com/CowboyBingus/BingusSharedLoader (loader v18).
 """
 import argparse
 import json
@@ -78,7 +78,7 @@ def build_addon(name, source, guid, output, display_name=None):
 	resource = struct.pack("<II", len(body), 2) + body
 	archive = make_archive({resource_hash(name): resource})
 	title = display_name or name
-	description = "Requires Bingus Shared Loader v21 or newer / API 1. Enable both and deploy."
+	description = "Requires Chef Shared Loader 1.5.0 or newer (API 1). Enable both and deploy."
 	manifest = {
 		"Version": 1,
 		"Guid": guid,

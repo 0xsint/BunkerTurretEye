@@ -1,6 +1,6 @@
 """Lua 5.1 gate for the mod: compiles it, counts the locals the main chunk holds open,
 loads it under the fake game in tools/analysis/harness.lua, and reports every global
-it leaks into the environment it shares with the other Bingus mods.
+it leaks into the environment it runs in.
 
 Helldivers 2's current builds run plain Lua 5.1.4: a chunk may hold at most 200 locals,
 there is no 5.2+ syntax, and _G is shared, so all three of these matter before shipping.
@@ -15,8 +15,8 @@ from lupa import lua51
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Globals the mod is expected to define or replace: `update` is the game's tick hook it
-# chains, and the mod table itself is returned rather than assigned.
+# Globals the mod is expected to define or replace: `update` is the tick hook Chef calls it
+# through, and the mod table itself is returned rather than assigned.
 ALLOWED_GLOBALS = {"update"}
 
 
@@ -76,7 +76,7 @@ def main(path):
             print(f"        {item}")
         failures.append(f"{len(leaked)} leaked globals")
     else:
-        print("ok    defines no globals beyond the update() hook it must chain")
+        print("ok    defines no globals beyond its update() hook")
 
     if failures:
         print("\nFAILED: " + "; ".join(failures))
